@@ -1,0 +1,54 @@
+{
+  "name": "incipit",
+  "version": "0.1.0",
+  "description": "Typesetting patch for AI chat interfaces — designed for long-form reading",
+  "bin": {
+    "incipit": "bin/cli.js"
+  },
+  "main": "src/install.js",
+  "files": [
+    "bin/",
+    "src/",
+    "data/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/cli.js",
+    "apply": "node bin/cli.js apply",
+    "restore": "node bin/cli.js restore"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "incipit",
+    "claude-code",
+    "claude",
+    "anthropic",
+    "vscode",
+    "vscode-extension",
+    "latex",
+    "katex",
+    "cjk",
+    "typography",
+    "markdown",
+    "serif",
+    "render"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yc-duan/incipit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yc-duan/incipit/issues"
+  },
+  "homepage": "https://github.com/yc-duan/incipit#readme",
+  "author": "",
+  "license": "MIT"
+}

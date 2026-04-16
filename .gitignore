@@ -1,0 +1,23 @@
+# Node
+node_modules/
+npm-debug.log*
+*.tgz
+.npm/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# AI agent files (not for public repo)
+.sisyphus/
+CLAUDE.md
+AGENTS.md
+
+# Build/temp artifacts (in case someone tries PyInstaller again)
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec

@@ -1,0 +1,1157 @@
+/* ============================================================
+   Typography-led webview theme.
+
+   Latin: IBM Plex Serif (`Reading` 400 / `Emphasis` 600)
+   CJK: Noto Sans SC (`Reading` 400 / `Emphasis` 600)
+   Mono: Rec Mono Linear (`MONO=1`, `CASL=0`)
+   ============================================================ */
+
+/* ---------- Reading layer (Latin Plex Serif 400 / CJK Noto 400) ---------- */
+@font-face {
+  font-family: 'Reading';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/ibm-plex-serif/IBMPlexSerif-400.woff2') format('woff2');
+  unicode-range: U+0000-024F, U+1E00-1EFF, U+2000-206F, U+2070-209F,
+                 U+20A0-20CF, U+2100-214F, U+2190-21FF, U+2200-22FF;
+}
+@font-face {
+  font-family: 'Reading';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/noto-sans-sc/NotoSansSC-400.woff2') format('woff2');
+  unicode-range: U+3000-303F, U+3040-309F, U+30A0-30FF,
+                 U+3400-4DBF, U+4E00-9FFF, U+F900-FAFF,
+                 U+FE30-FE4F, U+FF00-FFEF;
+}
+
+/* ---------- Emphasis layer (Latin Plex Serif 600 / CJK Noto 600) ----------
+   Both `@font-face` rules are declared at weight 400.
+   Boldness is encoded in the family name, so `font-family: Emphasis` plus
+   `font-weight: 400` resolves to the real semibold glyphs. */
+@font-face {
+  font-family: 'Emphasis';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/ibm-plex-serif/IBMPlexSerif-600.woff2') format('woff2');
+  unicode-range: U+0000-024F, U+1E00-1EFF, U+2000-206F, U+2070-209F,
+                 U+20A0-20CF, U+2100-214F, U+2190-21FF, U+2200-22FF;
+}
+@font-face {
+  font-family: 'Emphasis';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/noto-sans-sc/NotoSansSC-600.woff2') format('woff2');
+  unicode-range: U+3000-303F, U+3040-309F, U+30A0-30FF,
+                 U+3400-4DBF, U+4E00-9FFF, U+F900-FAFF,
+                 U+FE30-FE4F, U+FF00-FFEF;
+}
+
+/* ---------- Recursive VF base for `Rec Mono Linear` ----------
+   Use `MONO=1`, `CASL=0`, and `slnt=0` as the default mono variant.
+   Individual selectors repeat `font-variation-settings` because some
+   Chromium builds do not fully honor the `@font-face` descriptor. */
+@font-face {
+  font-family: 'Rec Mono Linear';
+  font-style: normal;
+  font-weight: 300 1000;
+  font-display: swap;
+  src: url('fonts/recursive/Recursive-VF.woff2') format('woff2');
+  /* Lock the axes at the `@font-face` level when the browser supports it. */
+  font-variation-settings: "MONO" 1, "CASL" 0, "slnt" 0;
+}
+
+/* ============================================================
+   Message container baseline.
+
+   Keep the message surface opaque, remove background images, and avoid
+   extra `isolation` or `contain` side effects.
+   ============================================================ */
+
+[data-incipit-messages-container] {
+  position: relative !important;
+  background: #1e1e1e !important;
+  background-color: #1e1e1e !important;
+  background-image: none !important;
+  isolation: auto !important;
+  contain: none !important;
+}
+
+/* ============================================================
+   Base message typography.
+   ============================================================ */
+
+[data-incipit-message] {
+  font-size: 14px;
+}
+
+/* Calibrate the timeline marker dot and connector for the adjusted message
+   typography. Different message shapes need slightly different top offsets. */
+
+/* Default offset for compact single-line items such as tool calls. */
+[data-incipit-message]::before {
+  top: 15px !important;
+}
+
+/* Replies and thinking blocks start with a paragraph and sit slightly lower. */
+[data-incipit-message]:has(> [data-incipit-markdown-root] > p)::before,
+[data-incipit-message]:has(> [data-incipit-markdown-root] span > p)::before,
+[data-incipit-message]:has([data-incipit-thinking-content])::before,
+[data-incipit-message]:has([data-incipit-thinking-summary])::before {
+  top: 16px !important;
+}
+
+/* The host's thinking SVG is re-rendered during streaming and can drift out
+   of sync with the frozen `<details>` state, so hide it and render our own
+   arrow from a stable pseudo-element instead. */
+details[data-incipit-thinking] > summary[data-incipit-thinking-summary] svg[data-incipit-thinking-toggle] {
+  display: none !important;
+}
+details[data-incipit-thinking] > summary[data-incipit-thinking-summary]::after {
+  content: "";
+  display: inline-block;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  background-color: currentColor;
+  opacity: 0.92;
+  transform-origin: 50% 50%;
+  transition: transform 0.15s ease;
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg width='20' height='20' viewBox='0 0 20 20' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M7.12771 5.16489C7.28926 4.98544 7.55225 4.95072 7.75273 5.0682L7.83477 5.12778L12.835 9.62788C12.9402 9.72264 12.9999 9.85833 13 9.99995C13 10.1063 12.9667 10.2093 12.9053 10.2939L12.835 10.372L7.83477 14.8721C7.62952 15.0567 7.31242 15.0402 7.12771 14.835C6.94336 14.6298 6.95983 14.3126 7.16482 14.128L11.7519 9.99995L7.16482 5.87193L7.09744 5.79674C6.95939 5.60969 6.96617 5.34444 7.12771 5.16489Z' fill='black'/%3E%3C/svg%3E");
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: 16px 16px;
+  mask-image: url("data:image/svg+xml,%3Csvg width='20' height='20' viewBox='0 0 20 20' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M7.12771 5.16489C7.28926 4.98544 7.55225 4.95072 7.75273 5.0682L7.83477 5.12778L12.835 9.62788C12.9402 9.72264 12.9999 9.85833 13 9.99995C13 10.1063 12.9667 10.2093 12.9053 10.2939L12.835 10.372L7.83477 14.8721C7.62952 15.0567 7.31242 15.0402 7.12771 14.835C6.94336 14.6298 6.95983 14.3126 7.16482 14.128L11.7519 9.99995L7.16482 5.87193L7.09744 5.79674C6.95939 5.60969 6.96617 5.34444 7.12771 5.16489Z' fill='black'/%3E%3C/svg%3E");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: 16px 16px;
+}
+details[data-incipit-thinking][open] > summary[data-incipit-thinking-summary]::after {
+  transform: rotate(90deg);
+}
+details[data-incipit-thinking]:not([open]) > summary[data-incipit-thinking-summary]::after {
+  transform: none;
+}
+
+
+/* Thicken the connector to 2px and keep it centered under the marker dot. */
+[data-incipit-message]::after {
+  width: 2px !important;
+  left: 11.5px !important;
+  background-color: rgba(255, 255, 255, 0.18) !important;
+}
+
+
+/* Limit reading width to 64ch for the narrower webview measure. */
+[data-incipit-markdown-root] > p,
+[data-incipit-markdown-root] > ul,
+[data-incipit-markdown-root] > ol,
+[data-incipit-markdown-root] > blockquote,
+[data-incipit-message] > p,
+[data-incipit-message] > ul,
+[data-incipit-message] > ol,
+[data-incipit-message] > blockquote {
+  max-width: 64ch;
+}
+
+/* Apply the body face across text elements. `unicode-range` routes Latin to
+   Plex Serif and CJK to Noto Sans SC. */
+[data-incipit-message],
+[data-incipit-message] p,
+[data-incipit-message] li,
+[data-incipit-message] td,
+[data-incipit-message] th,
+[data-incipit-message] blockquote,
+[data-incipit-message] h1,
+[data-incipit-message] h2,
+[data-incipit-message] h3,
+[data-incipit-message] h4,
+[data-incipit-message] h5,
+[data-incipit-message] h6 {
+  font-family: 'Reading', 'IBM Plex Serif', 'Noto Sans SC',
+               'Microsoft YaHei UI', 'Microsoft YaHei',
+               'PingFang SC', system-ui, serif !important;
+  /* Leave smoothing to Chromium so Windows can keep subpixel rendering. */
+  font-feature-settings: 'kern', 'liga', 'calt';
+}
+
+/* Paragraph rhythm. */
+[data-incipit-message] p,
+[data-incipit-markdown-root] p {
+  line-height: 1.68;
+  margin: 1.0em 0;
+}
+[data-incipit-markdown-root] p { margin: 1.0em 0 !important; }
+
+/* Remove the first top margin so the first line aligns with the timeline dot. */
+[data-incipit-markdown-root] > p:first-child,
+[data-incipit-message] > p:first-child {
+  margin-top: 0 !important;
+}
+[data-incipit-markdown-root] > p:last-child,
+[data-incipit-message] > p:last-child {
+  margin-bottom: 0 !important;
+}
+
+/* Restore markdown soft-wrap behavior instead of treating lone newlines as
+   hard line breaks. */
+[data-incipit-markdown-root] p,
+[data-incipit-markdown-root] li,
+[data-incipit-markdown-root] blockquote,
+[data-incipit-markdown-root] td,
+[data-incipit-markdown-root] th,
+[data-incipit-message] p,
+[data-incipit-message] li,
+[data-incipit-message] blockquote,
+[data-incipit-message] td,
+[data-incipit-message] th {
+  white-space: normal !important;
+}
+
+/* ============================================================
+   CJK-to-ASCII punctuation spacing.
+
+   JS wraps ASCII punctuation that touches CJK text in `.claude-punc`.
+   Horizontal padding creates the visual breathing room.
+   ============================================================ */
+.claude-punc {
+  padding-left: 0.15em;
+  padding-right: 0.15em;
+}
+
+/* Native CSS fallback for browsers that support `text-autospace`. */
+[data-incipit-message],
+[data-incipit-message] p,
+[data-incipit-message] li,
+[data-incipit-message] td,
+[data-incipit-message] th,
+[data-incipit-message] blockquote,
+[data-incipit-message] h1,
+[data-incipit-message] h2,
+[data-incipit-message] h3,
+[data-incipit-message] h4,
+[data-incipit-message] h5,
+[data-incipit-message] h6,
+[data-incipit-markdown-root] p,
+[data-incipit-markdown-root] li,
+[data-incipit-markdown-root] blockquote,
+[data-incipit-markdown-root] td,
+[data-incipit-markdown-root] th {
+  text-autospace: normal;
+  text-spacing-trim: normal;
+}
+
+/* ============================================================
+   Selection highlight.
+   ============================================================ */
+[data-incipit-message] ::selection,
+[data-incipit-markdown-root] ::selection {
+  background: rgba(217,119,87,0.32) !important;
+  color: inherit !important;
+}
+
+/* ============================================================
+   Links keep the body text color. Affordance is a dotted terracotta
+   underline, sitting well below the baseline, echoing the scholarly
+   `<abbr>` convention rather than a web hyperlink.
+   ============================================================ */
+[data-incipit-message] a,
+[data-incipit-message] a:link,
+[data-incipit-message] a:visited,
+[data-incipit-markdown-root] a,
+[data-incipit-markdown-root] a:link,
+[data-incipit-markdown-root] a:visited {
+  color: inherit !important;
+  text-decoration: none !important;
+  /* Draw the affordance as evenly spaced dots using a radial gradient so
+     that dot size and dot gap are both explicit. Browser-drawn `dotted`
+     text-decoration packs the dots too tightly for serif body text. */
+  background-image:
+    radial-gradient(circle, rgba(217, 119, 87, 0.92) 1px, transparent 1.6px) !important;
+  background-size: 7px 2px !important;
+  background-repeat: repeat-x !important;
+  background-position: 0 100% !important;
+  background-color: transparent;
+  padding: 0 2px 2px !important;
+  margin: 0 -2px;
+  border-radius: 2px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  transition: background-color 0.15s ease;
+}
+[data-incipit-message] a:hover,
+[data-incipit-markdown-root] a:hover {
+  /* Brief highlighter-pen swipe on hover. The gradient dot layer stays on
+     top; the color layer sits beneath via `background-color`, so the whole
+     link reacts as one element without staining the text ink. */
+  background-color: rgba(217, 119, 87, 0.22) !important;
+}
+[data-incipit-message] a:focus-visible,
+[data-incipit-markdown-root] a:focus-visible {
+  outline: 1px solid rgba(217,119,87,0.6);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ============================================================
+   Heading hierarchy.
+
+   Headings use `Emphasis` and separate levels through size, spacing, and
+   margins instead of heavier weight values.
+   ============================================================ */
+[data-incipit-message] h1 {
+  font-family: 'Emphasis', 'Reading', serif !important;
+  font-size: 1.42em;
+  font-weight: 400;
+  margin: 1.8em 0 0.45em;
+  line-height: 1.32;
+  letter-spacing: -0.012em;
+}
+[data-incipit-message] h2 {
+  font-family: 'Emphasis', 'Reading', serif !important;
+  font-size: 1.22em;
+  font-weight: 400;
+  margin: 1.5em 0 0.4em;
+  line-height: 1.36;
+  letter-spacing: -0.008em;
+}
+[data-incipit-message] h3 {
+  font-family: 'Emphasis', 'Reading', serif !important;
+  font-size: 1.08em;
+  font-weight: 400;
+  margin: 1.2em 0 0.3em;
+  line-height: 1.44;
+  letter-spacing: -0.004em;
+}
+[data-incipit-message] h4 {
+  font-family: 'Emphasis', 'Reading', serif !important;
+  font-size: 1em;
+  font-weight: 400;
+  margin: 0.9em 0 0.2em;
+}
+[data-incipit-message] h5,
+[data-incipit-message] h6 {
+  font-family: 'Emphasis', 'Reading', serif !important;
+  font-size: 1em;
+  font-weight: 400;
+  margin: 0.8em 0 0.2em;
+}
+
+/* ============================================================
+   Inline `strong` / `b` use the `Emphasis` family.
+   ============================================================ */
+[data-incipit-message] strong,
+[data-incipit-message] b {
+  font-family: 'Emphasis', 'Reading', serif !important;
+  font-weight: 400 !important;
+}
+
+/* ============================================================
+   Lists.
+   ============================================================ */
+[data-incipit-message] ol,
+[data-incipit-message] ul {
+  padding-left: 1.55em !important;
+  list-style-position: outside !important;
+  margin: 0.8em 0;
+}
+[data-incipit-message] ol { list-style-type: decimal !important; }
+[data-incipit-message] li {
+  margin: 0.32em 0;
+  line-height: 1.68;
+}
+[data-incipit-message] li > p {
+  margin: 0.25em 0;
+}
+
+/* ============================================================
+   Horizontal rule.
+   ============================================================ */
+[data-incipit-message] hr {
+  border: none;
+  height: 1px;
+  background: linear-gradient(to right,
+    transparent,
+    rgba(200,200,200,0.28) 20%,
+    rgba(200,200,200,0.28) 80%,
+    transparent);
+  margin: 1.8em 0;
+}
+
+/* ============================================================
+   Block quotes.
+   ============================================================ */
+[data-incipit-markdown-root] blockquote,
+[data-incipit-message] blockquote {
+  margin: 0.8em 0 !important;
+  padding: 0.15em 0 0.15em 0.9em !important;
+  border-left: 3px solid rgba(180,180,175,0.22) !important;
+  background: transparent !important;
+  color: #c3c2b7 !important;
+}
+[data-incipit-markdown-root] blockquote p,
+[data-incipit-message] blockquote p {
+  margin: 0.2em 0 !important;
+  color: #c3c2b7 !important;
+}
+
+/* ============================================================
+   Math (KaTeX HTML output).
+
+   KaTeX ships a solid base stylesheet via `katex.min.css`; these
+   rules only tune the bits we need for the literary rhythm: the
+   classical 1.21x TeX math scale, display margins, and a CSS reset
+   to keep body-level `letter-spacing` / `word-spacing` / `text-indent`
+   from leaking into KaTeX's internal vlist measurements.
+
+   Note: KaTeX's `\left\right` auto-sizing famously folds
+   `\underbrace` / `\overbrace` label depth into its vlist, which
+   dwarfs delimiters around a label body. The fix is applied at the
+   TeX source level in `enhance.js::wrapBraceLabels`, which wraps
+   every `\underbrace{...}_{...}` with `\smash[b]{...}` (and the
+   `\overbrace` counterpart with `\smash[t]{...}`). No CSS hack
+   needed — the vlist never sees the label depth in the first place.
+   ============================================================ */
+.katex {
+  /* Classical TeX math scale, Knuth era default. */
+  font-size: 1.21em;
+  font-family: KaTeX_Main, 'Times New Roman', serif;
+}
+.katex,
+.katex * {
+  text-indent: 0 !important;
+  letter-spacing: 0 !important;
+  word-spacing: 0 !important;
+}
+.claude-math[data-tex-display="1"] {
+  display: block;
+  width: 100%;
+}
+.katex-display {
+  margin: 1.1em auto !important;
+  padding: 0.3em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.claude-math[data-tex-display="1"] > .katex-display {
+  margin: 1.1em auto !important;
+}
+.katex .text,
+.katex .text *,
+.katex .textrm,
+.katex .textrm * {
+  font-family: KaTeX_Main, 'Noto Sans SC', 'Microsoft YaHei UI',
+               'Microsoft YaHei', 'PingFang SC', serif !important;
+}
+.claude-math[data-render-error] {
+  color: #ff6b6b;
+  border-bottom: 1px dashed #ff6b6b;
+}
+
+/* ============================================================
+   Monospace usage.
+
+   Repeat `font-variation-settings` on concrete selectors because some
+   Chromium builds do not reliably inherit them from `@font-face`.
+   ============================================================ */
+
+/* Footer chrome is not contenteditable, so it can keep the serif body face. */
+[data-incipit-footer-button-label],
+[data-incipit-command-label],
+[data-incipit-usage-label] {
+  font-family: 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+               system-ui, serif !important;
+  font-size: 14px !important;
+  line-height: 1.55 !important;
+}
+
+/* Keep the real contenteditable input untouched.
+   Input font settings are applied through `chat.fontFamily` in
+   `settings.json`. Only the non-editable placeholder keeps the serif body
+   face here. */
+[data-incipit-input-editor]::before,
+[data-incipit-input-editor]::before,
+[data-incipit-input-editor]::before {
+  font-family: 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+               system-ui, serif !important;
+}
+
+/* Tool headers use `Emphasis` with `font-weight: 400` so the browser picks
+   the real semibold font file instead of synthetic bold. */
+[data-incipit-tool-name] {
+  font-family: 'Emphasis', 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+               system-ui, serif !important;
+  font-size: 14px !important;
+  font-weight: 400 !important;
+  font-variation-settings: normal;
+}
+
+/* Tool arguments, paths, and commands stay monospace. */
+[data-incipit-tool-path],
+[data-incipit-tool-args],
+[data-incipit-tool-summary],
+[data-incipit-tool-command],
+[data-incipit-tool-path],
+[data-incipit-command-ref] {
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace !important;
+  font-variation-settings: "MONO" 1, "CASL" 0, "slnt" 0;
+}
+
+/* Fenced code blocks. */
+pre code,
+.hljs,
+[data-incipit-message] pre code,
+[data-incipit-markdown-root] pre code {
+  font-family: 'Rec Mono Linear', 'Noto Sans SC',
+               'Microsoft YaHei UI', 'Microsoft YaHei',
+               Consolas, Monaco, 'Courier New', monospace !important;
+  font-variation-settings: "MONO" 1, "CASL" 0, "slnt" 0;
+  font-size: 0.92em;
+  line-height: 1.55;
+}
+pre {
+  white-space: pre-wrap !important;
+  word-wrap: break-word !important;
+  overflow-wrap: break-word !important;
+  max-width: 100% !important;
+  margin: 1em 0;
+  border-radius: 6px;
+}
+
+/* Code block background only inside assistant markdown, not tool calls. */
+[data-incipit-markdown-root] pre,
+[data-incipit-message] [data-incipit-markdown-root] pre {
+  background: #272727 !important;
+  background-color: #272727 !important;
+}
+
+/* Prevent hljs theme from overriding back to #1e1e1e inside markdown. */
+[data-incipit-markdown-root] pre code,
+[data-incipit-message] [data-incipit-markdown-root] pre code {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+/* Tool call bodies must not inherit the code-block tint — their own
+   container already carries `--app-tool-background`. Two-attribute
+   specificity beats the single-attribute `[data-incipit-markdown-root] pre`
+   rule above, so this wins regardless of source order. */
+[data-incipit-message] [class*="toolBody"] pre,
+[data-incipit-message] [class*="toolBody"] pre code,
+[data-incipit-message] [class*="toolBodyRowContent"] pre,
+[data-incipit-message] [class*="toolBodyRowContent"] pre code {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+pre code {
+  white-space: pre-wrap !important;
+  word-break: break-word !important;
+}
+
+/* Inline code inherits the body face and stays visually lightweight. */
+[data-incipit-markdown-root] code:not(pre code),
+[data-incipit-message] code:not(pre code) {
+  font-family: inherit !important;
+  font-size: inherit !important;
+  font-weight: inherit !important;
+  line-height: inherit !important;
+  padding: 0 0.2em !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  border: none !important;
+  color: inherit !important;
+}
+
+/* ============================================================
+   Tables.
+
+   Book-style: only horizontal rules. A heavier rule closes the
+   header, a lighter rule separates body rows, and the last row
+   sits on open air. No vertical lines, no fill, no hover — the
+   table reads like a ledger in a printed monograph.
+   ============================================================ */
+[data-incipit-markdown-root] table,
+[data-incipit-message] table {
+  border-collapse: collapse !important;
+  border: none !important;
+  border-spacing: 0 !important;
+  width: 100%;
+  margin: 1.2em 0;
+  font-size: 0.95em;
+}
+[data-incipit-markdown-root] table th,
+[data-incipit-markdown-root] table td,
+[data-incipit-message] table th,
+[data-incipit-message] table td {
+  border: none !important;
+  border-bottom: 1px solid rgba(220, 210, 190, 0.30) !important;
+  padding: 7px 14px !important;
+  text-align: left;
+  vertical-align: top;
+}
+[data-incipit-markdown-root] table thead th,
+[data-incipit-message] table thead th {
+  border-bottom: 1.5px solid rgba(220, 210, 190, 0.45) !important;
+  font-family: 'Emphasis', 'Reading', serif !important;
+  font-weight: 400 !important;
+  color: rgba(248, 248, 246, 0.72);
+  padding-bottom: 6px !important;
+}
+[data-incipit-markdown-root] table tbody tr:last-child td,
+[data-incipit-message] table tbody tr:last-child td {
+  border-bottom: none !important;
+}
+
+/* ============================================================
+   Permission-mode indicators.
+   ============================================================ */
+[data-claude-softened] {
+  color: #d97757 !important;
+  background: rgba(217,119,87,0.08) !important;
+  border-color: rgba(217,119,87,0.35) !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+}
+[data-claude-softened] * {
+  color: #d97757 !important;
+  background: transparent !important;
+  fill: #d97757 !important;
+  stroke: #d97757 !important;
+}
+
+/* ============================================================
+   Send / stop button treatment and permission-mode palette.
+
+   Hide the host SVGs and draw replacement icons with `mask-image` on
+   `::before`.
+   ============================================================ */
+
+/* The button body stays neutral. Permission mode is expressed through the
+   icon color instead of the full button fill. */
+[data-incipit-send-button] {
+  position: relative !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  border-radius: 8px !important;
+  background-color: #3d3b36 !important;  /* Slightly lighter than the input fill. */
+  color: #F5F2E8 !important;              /* Default ivory icon color. */
+  transition: background-color 0.15s ease !important;
+}
+[data-incipit-send-button]:hover {
+  background-color: #48463f !important;
+}
+
+[data-incipit-send-button][data-permission-mode="acceptEdits"] {
+  color: #C5B995 !important;              /* Warm sand. */
+}
+[data-incipit-send-button][data-permission-mode="plan"] {
+  color: #827B6E !important;              /* Ash brown. */
+}
+[data-incipit-send-button][data-permission-mode="bypassPermissions"],
+[data-incipit-send-button][data-permission-mode="auto"] {
+  color: #D97757 !important;              /* Terracotta accent. */
+}
+
+/* Hide the host `send` and `stop` icons.
+   Two layers: data-attribute selectors for steady state, AND host class
+   selectors that fire the instant the DOM node appears — before
+   MutationObserver has a chance to tag it.  This eliminates the brief
+   original-SVG flash during send → stop transitions. */
+[data-incipit-send-button] [data-incipit-send-icon],
+[data-incipit-send-button] [data-incipit-stop-icon],
+[data-incipit-send-button] [class*="sendIcon"],
+[data-incipit-send-button] [class*="stopIcon"],
+[class*="sendButton"] [class*="sendIcon"],
+[class*="sendButton"] [class*="stopIcon"] {
+  display: none !important;
+}
+
+/* Draw the replacement icon on `::before` and tint it with `currentColor`. */
+[data-incipit-send-button]::before {
+  content: "" !important;
+  display: block !important;
+  width: 20px !important;
+  height: 20px !important;
+  background-color: currentColor !important;
+  -webkit-mask-size: contain !important;
+  mask-size: contain !important;
+  -webkit-mask-position: center !important;
+  mask-position: center !important;
+  -webkit-mask-repeat: no-repeat !important;
+  mask-repeat: no-repeat !important;
+}
+
+/* Send state: thin right-pointing arrow. */
+[data-incipit-send-button][data-incipit-send-state="send"]::before {
+  -webkit-mask-image: url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 10 L16 10 M11 5 L16 10 L11 15'/%3E%3C/svg%3E") !important;
+  mask-image: url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 10 L16 10 M11 5 L16 10 L11 15'/%3E%3C/svg%3E") !important;
+}
+
+/* Stop state: centered rounded square chip. */
+[data-incipit-send-button][data-incipit-send-state="stop"]::before {
+  -webkit-mask-image: url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Crect x='5' y='5' width='10' height='10' rx='1.5' ry='1.5' fill='%23000'/%3E%3C/svg%3E") !important;
+  mask-image: url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Crect x='5' y='5' width='10' height='10' rx='1.5' ry='1.5' fill='%23000'/%3E%3C/svg%3E") !important;
+}
+
+/* Flatten the real input fieldset and its background layer.
+   Do not target the outer wrapper or the fill will expand across the
+   remaining chat viewport. */
+[data-incipit-input-container],
+[data-incipit-input-container]:focus-within,
+[data-incipit-input-container][data-permission-mode="acceptEdits"],
+[data-incipit-input-container][data-permission-mode="acceptEdits"]:focus-within,
+[data-incipit-input-container][data-permission-mode="plan"],
+[data-incipit-input-container][data-permission-mode="plan"]:focus-within,
+[data-incipit-input-container][data-permission-mode="bypassPermissions"],
+[data-incipit-input-container][data-permission-mode="bypassPermissions"]:focus-within,
+[data-incipit-input-container][data-permission-mode="auto"],
+[data-incipit-input-container][data-permission-mode="auto"]:focus-within {
+  background: #2c2c2a !important;
+  background-color: #2c2c2a !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  --focus-ring-color: transparent !important;
+  border-radius: 10px !important;
+}
+[data-incipit-input-container-bg] {
+  background: #2c2c2a !important;
+  background-color: #2c2c2a !important;
+  border-radius: 10px !important;
+}
+
+/* Remove the divider above the input footer. */
+[data-incipit-input-footer] {
+  border-top: none !important;
+}
+
+/* Remove dividers around the attached-files container. */
+[data-incipit-attached-files-top],
+[data-incipit-attached-files] {
+  border-top: none !important;
+  border-bottom: none !important;
+}
+
+/* Use the same flat fill treatment for menus and user bubbles. */
+[data-incipit-menu-popup] {
+  background: #2c2c2a !important;
+  background-color: #2c2c2a !important;
+}
+[data-incipit-user-bubble] {
+  background: #121212 !important;
+  background-color: #121212 !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  border-radius: 10px !important;
+}
+
+/* Interrupted messages are not real user bubbles. Keep them transparent. */
+[data-incipit-user-bubble]:has([data-incipit-interrupted-message]) {
+  background: transparent !important;
+  background-color: transparent !important;
+  border-radius: 0 !important;
+}
+
+/* Right-align user bubbles by collapsing the intermediate flex wrapper with
+   `display: contents`.
+   The outer container must stay transparent or the full-width wrapper will
+   blend into the bubble fill. */
+/* Outer `userMessageContainer`: block + right alignment. */
+[data-incipit-user-message-container][data-incipit-sticky-message]:not(:has([data-incipit-interrupted-message])),
+[data-incipit-user-message-container]:not(:has([data-incipit-interrupted-message])) {
+  display: block !important;
+  width: 100% !important;
+  text-align: right !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+}
+/* Collapse the `container_v2` wrapper out of the layout tree. */
+[data-incipit-user-message-container]:not(:has([data-incipit-interrupted-message]))
+  [data-incipit-user-layout-wrapper] {
+  display: contents !important;
+}
+/* Bubble element: shrink to content with a capped width. */
+[data-incipit-user-bubble]:not(:has([data-incipit-interrupted-message])) {
+  display: inline-block !important;
+  max-width: min(34em, 76%) !important;
+  width: fit-content !important;
+  text-align: left !important;
+  vertical-align: top !important;
+  padding: 9px 13px !important;
+}
+[data-incipit-user-bubble]:not(:has([data-incipit-interrupted-message])) [data-incipit-user-content] {
+  max-width: none !important;
+  width: auto !important;
+}
+
+/* Normalize list selection colors across menus and dropdowns. */
+:root,
+[data-incipit-menu-popup],
+[data-incipit-dropdown],
+[data-incipit-command-list],
+[data-incipit-command-item] {
+  --app-list-active-background: #121212 !important;
+  --app-list-active-foreground: #F5F2E8 !important;
+  --vscode-list-activeSelectionBackground: #121212 !important;
+  --vscode-list-focusBackground: #121212 !important;
+  --vscode-list-hoverBackground: #1a1a19 !important;
+}
+[data-incipit-command-item-active],
+[data-incipit-command-item][aria-selected="true"],
+[data-incipit-command-item].active,
+[data-incipit-dropdown] [aria-selected="true"],
+[data-incipit-dropdown] .active {
+  background: #121212 !important;
+  background-color: #121212 !important;
+  color: #F5F2E8 !important;
+}
+
+/* Match the conversation-history dropdown to the flat popup treatment. */
+[data-incipit-dropdown] {
+  background: #2c2c2a !important;
+  background-color: #2c2c2a !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  border-radius: 10px !important;
+}
+
+/* Disable the host truncation UI.
+   JS measures height, marks `data-claude-length`, and inserts the custom
+   show-more row instead. Hide both the button and its wrapper so no empty
+   flex gap remains. */
+[data-incipit-truncation-gradient],
+[data-incipit-user-bubble] [data-incipit-host-show-more],
+[data-incipit-user-bubble] [data-incipit-host-show-more],
+[data-incipit-user-bubble] [data-incipit-host-show-more] {
+  display: none !important;
+}
+
+/* Measuring, short, and expanded states should not be clipped. */
+[data-incipit-user-bubble][data-claude-length="measuring"] [data-incipit-user-expandable],
+[data-incipit-user-bubble][data-claude-length="measuring"] [data-incipit-user-content],
+[data-incipit-user-bubble][data-claude-length="short"] [data-incipit-user-expandable],
+[data-incipit-user-bubble][data-claude-length="short"] [data-incipit-user-content],
+[data-incipit-user-bubble][data-claude-length="long"][data-claude-expanded="1"] [data-incipit-user-expandable],
+[data-incipit-user-bubble][data-claude-length="long"][data-claude-expanded="1"] [data-incipit-user-content] {
+  max-height: none !important;
+  overflow: visible !important;
+}
+/* Remove the host clip first so the custom clip can take over. */
+[data-incipit-user-bubble][data-claude-length="long"] [data-incipit-user-expandable] {
+  max-height: none !important;
+  overflow: visible !important;
+}
+/* Collapsed long messages clip the inner content to about 20 lines. */
+[data-incipit-user-bubble][data-claude-length="long"]:not([data-claude-expanded="1"]) [data-incipit-user-content] {
+  max-height: 600px !important;
+  overflow: hidden !important;
+}
+
+/* Custom show-more row injected at the end of the bubble. */
+.claude-show-more-row {
+  display: block;
+  margin-top: 8px;
+  text-align: right;
+}
+.claude-show-more-btn {
+  background: transparent;
+  border: none;
+  outline: none;
+  padding: 2px 4px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  color: rgba(255,255,255,0.50);
+  transition: color 0.15s;
+}
+.claude-show-more-btn:hover {
+  color: #F5F2E8;
+}
+
+/* Disable the sticky recent-user-message header without hiding the node. */
+[data-incipit-sticky-message] {
+  position: static !important;
+  background-image: none !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  top: auto !important;
+  z-index: auto !important;
+}
+
+/* Keep the spinner on the same permission-mode color axis.
+   Duplicate selectors with host classes prevent the original color from
+   flashing before MutationObserver tags the nodes. */
+[data-incipit-spinner-row] [data-incipit-spinner-container] [data-incipit-spinner-icon],
+[class*="spinnerRow"] [class*="container_"] [class*="icon_"] {
+  color: #EAE4D5 !important;  /* default */
+}
+[data-incipit-spinner-row] [data-incipit-spinner-container][data-permission-mode="acceptEdits"] [data-incipit-spinner-icon],
+[class*="spinnerRow"] [class*="container_"][data-permission-mode="acceptEdits"] [class*="icon_"] {
+  color: #C9C0A8 !important;
+}
+[data-incipit-spinner-row] [data-incipit-spinner-container][data-permission-mode="plan"] [data-incipit-spinner-icon],
+[class*="spinnerRow"] [class*="container_"][data-permission-mode="plan"] [class*="icon_"] {
+  color: #A8A095 !important;
+}
+[data-incipit-spinner-row] [data-incipit-spinner-container][data-permission-mode="bypassPermissions"] [data-incipit-spinner-icon],
+[data-incipit-spinner-row] [data-incipit-spinner-container][data-permission-mode="auto"] [data-incipit-spinner-icon],
+[class*="spinnerRow"] [class*="container_"][data-permission-mode="bypassPermissions"] [class*="icon_"],
+[class*="spinnerRow"] [class*="container_"][data-permission-mode="auto"] [class*="icon_"] {
+  color: #D97757 !important;
+}
+
+/* ============================================================
+   User-message copy button.
+
+   The button lives in a transparent sibling row outside the bubble so the
+   bubble padding stays compact.
+   ============================================================ */
+.claude-user-copy-btn-row {
+  display: block;
+  margin: 0;
+  padding: 4px 0 0 0;
+  text-align: right;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+}
+/* Keep the button visible while hovering either the bubble wrapper or the row. */
+[data-incipit-user-message-container]:hover .claude-user-copy-btn-row,
+.claude-user-copy-btn-row:hover {
+  opacity: 1;
+  pointer-events: auto;
+}
+.claude-user-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: rgba(255,255,255,0.55);
+  transition: color 0.15s, background 0.15s;
+}
+.claude-user-copy-btn svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+.claude-user-copy-btn:hover {
+  color: #F5F2E8;
+  background: rgba(255,255,255,0.06);
+}
+.claude-user-copy-btn.copied {
+  color: #C5B995;
+}
+
+/* ============================================================
+   Cache badge.
+
+   Inserted into the input footer before the bypass/send controls.
+   Data arrives from the extension host through `webview.postMessage`.
+   ============================================================ */
+/* Pill-shaped button that matches the footer control language. */
+.cceBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+               system-ui, serif;
+  font-size: 14px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums; /* Keep digits monospaced to avoid width jitter. */
+  color: #f8f8f6;                     /* Match the footer button text color. */
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 8px;
+  margin: 0;
+  white-space: pre;                   /* Preserve multi-space separators. */
+  user-select: none;
+  letter-spacing: 0;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+  -webkit-appearance: none;
+  appearance: none;
+  font-kerning: normal;
+}
+.cceBadge:hover,
+.cceBadge:focus-visible {
+  background: #3a3b3a;                /* Solid hover and focus background. */
+  color: #f8f8f6;
+  outline: none;
+}
+.cceBadge:active {
+  background: #2c2c2a;                /* Deeper pressed state. */
+}
+.cceBadgeIcon {
+  flex: 0 0 auto;
+  display: block;
+  width: 18px;
+  height: 18px;
+  color: #f8f8f6;                     /* SVG follows `currentColor`. */
+}
+.cceBadgeText {
+  display: inline-block;
+}
+.cceBadgeLabel {
+  color: #f8f8f6;
+}
+.cceBadgeVal {
+  color: #989898;
+}
+.cceBadge.cceBadgeActive {
+  background: #3a3b3a;
+}
+
+/* Preserve width during reveal animation to avoid layout jitter. */
+.cceBadgeVal {
+  display: inline-block;
+  white-space: pre;
+}
+
+/* ============================================================
+   Cache badge popup.
+   ============================================================ */
+.cceStatPopup {
+  position: fixed;
+  z-index: 99999;
+  display: none;
+  min-width: 320px;
+  max-width: 400px;
+  padding: 14px 16px;
+  background: #2c2c2a;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  box-shadow: 0 12px 36px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.35);
+  font-family: 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+               system-ui, serif;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #e8e6dd;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.cceStatPopup.cceStatOpen {
+  display: block;
+}
+.cceStatSection {
+  display: block;
+}
+.cceStatHeading {
+  font-family: 'Emphasis', 'Reading', serif;
+  font-size: 11px;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #f8f8f6;        /* Match the badge text as the popup focal color. */
+  margin-bottom: 8px;
+}
+.cceStatDivider {
+  height: 1px;
+  background: rgba(255,255,255,0.07);
+  margin: 12px 0;
+}
+
+/* Recent requests: time, context, and hit rate. */
+.cceStatRecent {
+  display: grid;
+  row-gap: 4px;
+}
+.cceStatRow {
+  display: grid;
+  grid-template-columns: 5em 1fr auto;
+  align-items: baseline;
+  column-gap: 12px;
+  color: #e8e6dd;
+}
+.cceStatTime {
+  color: #989898;
+  font-size: 12px;
+}
+.cceStatCtx {
+  text-align: right;
+  color: #e8e6dd;
+}
+.cceStatHit {
+  text-align: right;
+  color: #c3c2b7;
+  min-width: 4.5em;
+}
+
+/* Session totals: label, value, and optional extra column. */
+.cceStatTotals {
+  display: grid;
+  row-gap: 4px;
+}
+.cceStatKV {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: baseline;
+  column-gap: 12px;
+}
+.cceStatLabel {
+  color: #989898;
+  font-size: 12px;
+}
+.cceStatValue {
+  text-align: right;
+  color: #e8e6dd;
+}
+.cceStatExtra {
+  text-align: right;
+  color: #c3c2b7;
+  min-width: 4.5em;
+  font-size: 12px;
+}
+.cceStatEmpty {
+  color: #6a6a64;
+  font-size: 12px;
+  font-style: italic;
+}
+
+/* ============================================================
+   Effort slider & thinking toggle — colour-only overrides.
+
+   Only replace the host's blue accent with terracotta. Leave
+   all sizing, layout, and interaction behaviour to the host so
+   nothing can break on upgrades.
+   ============================================================ */
+
+/* Effort slider filled portion. */
+[data-incipit-menu-popup] [class*="fill_"] {
+  background-color: #a8896e !important;
+}
+
+/* Thinking toggle track (on state). */
+[data-incipit-menu-popup] [class*="trackOn"] {
+  background-color: #a8896e !important;
+}
+
+/* Usage bar fill (Account & usage panel). */
+[class*="usageFill"] {
+  background-color: #a8896e !important;
+}
+
