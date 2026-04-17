@@ -91,10 +91,35 @@ const STATIC_PROBES = Object.freeze([
 
 let observer = null;
 let fullRescanScheduled = false;
+let isComposing = false;
+let compositionListenersAttached = false;
+
+function scheduleFullRescan() {
+  if (fullRescanScheduled) return;
+  fullRescanScheduled = true;
+  requestAnimationFrame(() => {
+    fullRescanScheduled = false;
+    if (document.body) tagHostTree(document.body);
+  });
+}
+
+function attachCompositionListeners() {
+  if (compositionListenersAttached) return;
+  compositionListenersAttached = true;
+  // IME composition mutates the editor subtree in ways that Chromium's text
+  // layout cannot tolerate any style invalidation against. Suppress the
+  // observer while composing, then run a single catch-up rescan.
+  document.addEventListener('compositionstart', () => { isComposing = true; }, true);
+  document.addEventListener('compositionend', () => {
+    isComposing = false;
+    scheduleFullRescan();
+  }, true);
+}
 
 export function startHostProbe() {
   if (observer) return observer;
   if (!document.body) return null;
+  attachCompositionListeners();
   tagHostTree(document.body);
   observer = new MutationObserver(handleMutations);
   observer.observe(document.body, { childList: true, subtree: true });
@@ -135,8 +160,15 @@ export function closestByAttr(node, attr) {
 function handleMutations(mutations) {
   const active = document.activeElement;
   const editorFocused = active && active.isContentEditable;
-  let hasOutsideMutation = false;
 
+  // Hard stop during IME composition. Any setAttribute against an ancestor
+  // of the editor — even an idempotent one — can desynchronize Chromium's
+  // text advance cache from the composition buffer, leaving phantom glyphs
+  // that cannot be selected or deleted. compositionend schedules a single
+  // catch-up rescan, so nothing is lost.
+  if (editorFocused && isComposing) return;
+
+  let hasOutsideMutation = false;
   for (const mutation of mutations) {
     if (editorFocused && !active.contains(mutation.target)) {
       hasOutsideMutation = true;
@@ -147,69 +179,70 @@ function handleMutations(mutations) {
     }
   }
   // Skip the expensive full-body rescan only when ALL mutations are inside
-  // the contenteditable editor. The rescan runs setAttribute across the
-  // entire tree, which can trigger cascading relayouts that interfere with
-  // Chromium's text composition — especially for narrow-advance characters
-  // like `.` and `,` where caret positioning is fragile.
-  // But if any mutation landed outside the editor (e.g. send button state
-  // change), we must still rescan so attributes like send-state update.
+  // the contenteditable editor. But if any mutation landed outside the editor
+  // (e.g. send button state change), we must still rescan so attributes like
+  // send-state update.
   if (editorFocused && !hasOutsideMutation) return;
-  if (fullRescanScheduled) return;
-  fullRescanScheduled = true;
-  requestAnimationFrame(() => {
-    fullRescanScheduled = false;
-    if (document.body) tagHostTree(document.body);
-  });
+  scheduleFullRescan();
+}
+
+function ensureAttr(el, attr, value = '') {
+  if (!el || el.nodeType !== 1) return;
+  if (el.getAttribute(attr) === value) return;
+  el.setAttribute(attr, value);
 }
 
 function tagStaticSelectors(root) {
   if (root.nodeType !== 1) return;
   for (const [selector, attr] of STATIC_PROBES) {
-    if (root.matches?.(selector)) root.setAttribute(attr, '');
+    if (root.matches?.(selector) && !root.isContentEditable) ensureAttr(root, attr);
     root.querySelectorAll?.(selector).forEach(element => {
-      if (!element.isContentEditable) element.setAttribute(attr, '');
+      if (!element.isContentEditable) ensureAttr(element, attr);
     });
   }
 }
 
 function syncFooterHosts(root) {
   forEachHost(root, SEL.inputFooter, footer => {
-    clearDescendants(footer, ATTR.inputFooterHost);
-    const host = Array.from(footer.children).findLast(isFooterHostCandidate);
-    if (host) host.setAttribute(ATTR.inputFooterHost, '');
+    const currentHost = Array.from(footer.children).findLast(isFooterHostCandidate);
+    Array.from(footer.querySelectorAll(`[${ATTR.inputFooterHost}]`)).forEach(node => {
+      if (node !== currentHost) node.removeAttribute(ATTR.inputFooterHost);
+    });
+    if (currentHost) ensureAttr(currentHost, ATTR.inputFooterHost);
   });
 }
 
 function syncUserMessageNodes(root) {
   forEachHost(root, SEL.userMessageContainer, container => {
     container.querySelectorAll('[class*="container_v2"]').forEach(node => {
-      node.setAttribute(ATTR.userLayoutWrapper, '');
+      ensureAttr(node, ATTR.userLayoutWrapper);
     });
     const interrupted = container.querySelector('[class*="interruptedMessage"]');
-    if (interrupted) interrupted.setAttribute(ATTR.interruptedMessage, '');
-    const bubbles = container.querySelectorAll('[class*="userMessage_"]');
-    bubbles.forEach(node => tagUserBubble(node));
+    if (interrupted) ensureAttr(interrupted, ATTR.interruptedMessage);
+    container.querySelectorAll('[class*="userMessage_"]').forEach(node => tagUserBubble(node));
     container.querySelectorAll('[class*="content_"]').forEach(node => {
-      node.setAttribute(ATTR.userContent, '');
+      ensureAttr(node, ATTR.userContent);
     });
     container.querySelectorAll('[class*="expandableContainer"]').forEach(node => {
-      node.setAttribute(ATTR.userExpandable, '');
+      ensureAttr(node, ATTR.userExpandable);
     });
   });
 }
 
 function syncSendButtons(root) {
   forEachHost(root, '[class*="sendButton"]', button => {
-    button.setAttribute(ATTR.sendButton, '');
+    ensureAttr(button, ATTR.sendButton);
     button.querySelectorAll('[class*="sendIcon"]').forEach(node => {
-      node.setAttribute(ATTR.sendIcon, '');
+      ensureAttr(node, ATTR.sendIcon);
     });
     button.querySelectorAll('[class*="stopIcon"]').forEach(node => {
-      node.setAttribute(ATTR.stopIcon, '');
+      ensureAttr(node, ATTR.stopIcon);
     });
     const state = resolveSendState(button);
-    if (state) button.setAttribute('data-incipit-send-state', state);
-    else button.removeAttribute('data-incipit-send-state');
+    if (state) ensureAttr(button, 'data-incipit-send-state', state);
+    else if (button.hasAttribute('data-incipit-send-state')) {
+      button.removeAttribute('data-incipit-send-state');
+    }
   });
 }
 
@@ -220,22 +253,22 @@ function syncTransientControls(root) {
     ['[class*="showMore"]', ATTR.showMore],
   ];
   for (const [selector, attr] of probes) {
-    forEachHost(root, selector, element => element.setAttribute(attr, ''));
+    forEachHost(root, selector, element => ensureAttr(element, attr));
   }
 }
 
 function syncSpinnerNodes(root) {
   forEachHost(root, SEL.spinnerRow, row => {
     row.querySelectorAll('[class*="container_"]').forEach(node => {
-      node.setAttribute(ATTR.spinnerContainer, '');
+      ensureAttr(node, ATTR.spinnerContainer);
     });
     row.querySelectorAll('[class*="icon_"]').forEach(node => {
-      node.setAttribute(ATTR.spinnerIcon, '');
+      ensureAttr(node, ATTR.spinnerIcon);
     });
   });
   forEachHost(root, SEL.thinkingSummary, summary => {
     summary.querySelectorAll('[class*="thinkingToggle"]').forEach(node => {
-      node.setAttribute(ATTR.thinkingToggle, '');
+      ensureAttr(node, ATTR.thinkingToggle);
     });
   });
 }
@@ -244,10 +277,6 @@ function forEachHost(root, selector, callback) {
   if (root.nodeType !== 1) return;
   if (root.matches?.(selector)) callback(root);
   root.querySelectorAll?.(selector).forEach(callback);
-}
-
-function clearDescendants(root, attr) {
-  root.querySelectorAll?.(`[${attr}]`).forEach(node => node.removeAttribute(attr));
 }
 
 function isFooterHostCandidate(node) {

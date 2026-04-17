@@ -560,13 +560,52 @@ import { renderMathInSegment as rewriteMathInSegment } from './math_rewriter.js'
     if (dirty || pendingSegments.size) schedule();
   }
 
+  // Chromium bug workaround: a MutationObserver with `characterData: true`
+  // observing `document.body` disables the IME paint optimization for the
+  // contenteditable chat input. Every composition buffer update must
+  // generate a mutation record, which forces composition text through the
+  // regular paint path — but that path leaves the previous composition
+  // frame's pixels behind, accumulating as phantom glyphs (especially when
+  // narrow Latin punctuation like `,` `.` precedes wide CJK characters).
+  //
+  // Fix: scope the content observer to the messages container. The chat
+  // input lives in `inputContainer` which is a sibling, not a descendant,
+  // so the editor subtree is completely excluded from characterData
+  // observation and the paint optimization stays on.
+  const MESSAGES_ROOT_SELECTOR = '[class*="messagesContainer_"]';
+
   function setupObserver() {
-    const obs = new MutationObserver(handleMutations);
-    obs.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true,
+    let contentObs = null;
+    let attachedRoot = null;
+
+    function attachContent(root) {
+      if (!root || root === attachedRoot) return;
+      if (contentObs) contentObs.disconnect();
+      attachedRoot = root;
+      contentObs = new MutationObserver(handleMutations);
+      contentObs.observe(root, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+      for (const s of root.querySelectorAll(SEG_SELECTOR)) {
+        if (!s.isContentEditable) pendingSegments.add(s);
+      }
+      schedule();
+    }
+
+    const initial = document.querySelector(MESSAGES_ROOT_SELECTOR);
+    if (initial) attachContent(initial);
+
+    // Lightweight finder: childList-only on body, so it does NOT affect the
+    // editor's IME paint. Its job is to pick up messagesContainer when React
+    // mounts or remounts it, and hand it off to the content observer.
+    const finder = new MutationObserver(() => {
+      const root = document.querySelector(MESSAGES_ROOT_SELECTOR);
+      if (root && root !== attachedRoot) attachContent(root);
     });
+    finder.observe(document.body, { childList: true, subtree: true });
+
     enqueueInitialSegments();
     schedule();
   }
