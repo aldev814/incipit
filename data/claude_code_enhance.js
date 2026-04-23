@@ -1375,8 +1375,16 @@ import { renderMathInSegment as rewriteMathInSegment } from './math_rewriter.js'
     function positionPopup() {
       if (!popupEl || !popupAnchor) return;
       var r = popupAnchor.getBoundingClientRect();
-      // Place the popup above the badge and align their left edges.
-      popupEl.style.left = Math.round(r.left) + 'px';
+      var vw = window.innerWidth;
+      var margin = 8;
+      // Clamp max-width so a narrow side panel collapses the popup instead
+      // of letting it bleed past the viewport right edge.
+      popupEl.style.maxWidth = Math.min(400, Math.max(180, vw - margin * 2)) + 'px';
+      var w = popupEl.offsetWidth;
+      var left = Math.round(r.left);
+      if (left + w > vw - margin) left = vw - margin - w;
+      if (left < margin) left = margin;
+      popupEl.style.left = left + 'px';
       popupEl.style.bottom = Math.round(window.innerHeight - r.top + 6) + 'px';
     }
     function openPopup(anchor) {

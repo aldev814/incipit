@@ -484,6 +484,27 @@ details[data-incipit-thinking]:not([open]) > summary[data-incipit-thinking-summa
   line-height: 1.55 !important;
 }
 
+/* Menu popups ship with three variants whose font-size rules fragment into
+   0.9em / var(--vscode-chat-font-size) / inherited chains, yielding
+   12.6/13/14px within the same dropdown. Pin the container to 13px so the
+   label row matches the footer baseline; keep the description one step
+   smaller but above the 10.7px floor the bare host produces. */
+[data-incipit-menu-item],
+[data-incipit-menu-item-label] {
+  font-family: 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+               system-ui, serif !important;
+  font-size: 13px !important;
+  line-height: 1.55 !important;
+}
+[data-incipit-menu-item-description] {
+  font-family: 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+               system-ui, serif !important;
+  font-size: 12px !important;
+  line-height: 1.5 !important;
+}
+
 /* Keep the real contenteditable input untouched.
    Input font settings are applied through `chat.fontFamily` in
    `settings.json`. Only the non-editable placeholder keeps the serif body
@@ -992,7 +1013,7 @@ pre code {
   font-family: 'Reading', 'IBM Plex Serif', Georgia,
                'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
                system-ui, serif;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 400;
   font-variant-numeric: tabular-nums; /* Keep digits monospaced to avoid width jitter. */
   color: #f8f8f6;                     /* Match the footer button text color. */
