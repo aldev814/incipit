@@ -111,3 +111,88 @@ If Claude Code ever ships an official theming or style injection API, this proje
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+---
+
+## Full feature list
+
+Below is the complete set of user-visible changes incipit makes to the Claude Code chat interface, grouped by area.
+
+**Reading & typography**
+
+- Body text switches to serif fonts (IBM Plex Serif for Latin, Noto Sans SC for CJK), giving long-form reading a more natural rhythm
+- Line height, paragraph spacing, and heading spacing reset to proper typographic proportions
+- Heading hierarchy distinguished by weight and letter-spacing rather than size inflation; font sizes locked to integer pixels so serifs stay sharp on screen
+- Message-level H1 is visually demoted to the H2 size, leaving the page-top conversation title as the only heading-level focus
+- Color scheme redesigned as warm dark with a single restrained terracotta accent; the stock high-saturation warning elements are brought into a unified visual language
+- Links adopt a scholarly footnote style: text in body color, with a terracotta radial-dot underline beneath
+- User bubble, input box, and chat background form three naturally distinct layers instead of blending together
+- On Windows, font size and font parameters are specifically tuned so ClearType subpixel rendering stays in its sweet spot
+- Breathing space between CJK and Latin punctuation is generated automatically according to typographic rules
+- The blue accent on the Effort slider and Thinking toggle is remapped to a warm camel tone consistent with the rest of the palette
+
+**Math**
+
+- Stock Claude Code does not render math at all; incipit typesets it in place as mathematical symbols
+- Inline math `$...$` / `\(...\)` and display math `$$...$$` / `\[...\]` are all supported
+- Bare `\begin{pmatrix}...\end{pmatrix}` (without any outer `$$` wrapping) — common in Claude's output — is also recognized
+- 25 common LaTeX environments including align / cases / array / matrix / gather / multline are natively supported
+- `\text{中文}` inside formulas automatically switches to the body font stack instead of falling back to a Latin glyph
+- `\left(\underbrace{...}_{label}\right)` and similar labeled braces no longer balloon into oversized delimiters
+- All rendering happens locally via KaTeX — not a single byte goes to any server
+
+**Thinking blocks & user messages**
+
+- Thinking blocks you manually expand stay open when new streamed content arrives, instead of being collapsed back
+- Thinking blocks you did not expand are not force-opened by new content, so the viewport doesn't jump
+- User message bubbles get a copy button
+- Overly long user messages can be collapsed and expanded so they don't fill the viewport
+
+**Tool calls**
+
+- Tool calls are folded by default, so long conversations don't get buried under expanded diff editors
+- Edit / MultiEdit / Write operations display precise `+N / -M` line counts
+- Other tools (Bash / Read / Grep etc.) keep the host's short one-line summary as a fingerprint
+- The expand chevron uses the same animation as the thinking toggle
+- Deeply nested absolute paths are auto-truncated to `…\parent\filename`; hovering shows the full path
+- Clicking anywhere on the row toggles fold; the path itself remains text-selectable
+
+**Session usage monitoring**
+
+- A persistent badge sits at the bottom of the input box, showing current context size and cache hit rate
+- Click the badge to see per-turn breakdowns and cumulative session statistics
+- Data comes entirely from Claude Code's local on-disk logs, with no network requests
+- Compatible with non-Claude backends (Kimi / Deepseek / GLM etc.) — when no cache data is present, it shows `—` instead of a misleading `0.00%`
+- Value changes run a scanning animation, making updates visually obvious
+
+**Tables, blockquotes, lists, code**
+
+- Tables adopt the Booktabs scholarly style, keeping only top / middle / bottom rules
+- Blockquotes support multi-level nested visual hierarchy
+- Ordered / unordered / checkbox lists all have their rhythm reset to match body breathing
+- Code blocks use the monospaced Rec Mono Linear; multi-language syntax highlighting is bundled locally
+
+**Command-line tool**
+
+- Running `incipit` opens the interactive menu with full support for arrow keys, `j` / `k`, space, and enter; number shortcuts remain for backward compatibility
+- On first launch, a language picker (Chinese / English) appears automatically — a one-time selection
+- Three feature toggles inside the menu: math rendering / session usage badge / tool-call folding
+- Body font size switchable between 12 / 13 / 14, with all other proportions following suit
+- Each launch checks npm for a newer version (12-hour cache; can be disabled via environment variable or `--no-update-check`)
+- Offers to run the npm upgrade command for you when a new version exists — no need to type it out
+- `incipit apply` / `incipit restore` / `--help` are non-interactive subcommands safe to call from CI and scripts
+- Each apply is automatically backed up; multiple named backups can be kept and restored selectively
+- `settings.json` is tracked key-by-key rather than as a file blob, so your other VS Code configuration is never accidentally affected on restore
+- The frontispiece and CLI layout are designed around book-like typographic rhythm, with a compact fallback for short terminals
+
+**Fonts & system integration**
+
+- Three font families are bundled entirely inside the extension: IBM Plex Serif (Latin serif), Noto Sans SC (CJK), and Rec Mono Linear (monospace); the chat interface uses our chosen fonts regardless of whether the system has them installed
+- IBM Plex Serif is additionally installed to the user font directory (required by the VS Code input box's native font configuration, and usable by any other desktop app); the CJK and monospace fonts are already packaged inside the webview, so no system install is needed for them
+- Windows writes to the HKCU font registry (no admin rights required); Linux runs `fc-cache` to refresh the font index; macOS recognizes the font automatically without a refresh
+
+**Privacy & compliance**
+
+- Pure frontend rendering changes — no code touches anything that communicates with the model provider's servers
+- All assets (KaTeX / highlight.js / fonts / icons) are bundled locally — zero external network requests
+- Every byte you send is identical before and after installing incipit
