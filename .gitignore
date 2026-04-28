@@ -15,6 +15,9 @@ Thumbs.db
 CLAUDE.md
 AGENTS.md
 
+# Internal dev notes / design docs (not for public repo)
+dev-notes/
+
 # Build/temp artifacts (in case someone tries PyInstaller again)
 build/
 dist/

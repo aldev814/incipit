@@ -1,7 +1,7 @@
 {
   "name": "incipit",
-  "version": "0.1.4",
-  "description": "Typesetting patch for AI chat interfaces — designed for long-form reading",
+  "version": "0.1.5",
+  "description": "A frontend rework of the official Claude Code VS Code extension — surface redrawn, engine untouched.",
   "bin": {
     "incipit": "bin/cli.js"
   },

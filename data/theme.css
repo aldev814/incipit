@@ -66,6 +66,45 @@
 }
 
 /* ============================================================
+   First-paint colour variables (`--app-*`).
+
+   The host derives these from `--vscode-*` in its own stylesheet. By
+   the time `enhance.js` runs `applyAppVarOverrides()`, the host has
+   already painted with its own defaults — that is the visible flash
+   on every webview open. Baking the warm-black surface/foreground here
+   means `theme.css` already carries the right colours for first paint
+   (the HTML head injects `theme.css` render-blocking, in parallel with
+   the host's own `index.css`).
+
+   `enhance.js` keeps a MutationObserver on `<html>`'s inline style and
+   re-asserts these via `setProperty(..., 'important')` when the host
+   re-derives them inline. CSS `:root !important` covers stylesheet-
+   layer drift; the JS path covers inline-style drift. Do not delete
+   either — they protect different attack surfaces.
+   ============================================================ */
+:root {
+  --app-background: #1f1f1e !important;
+  --app-primary-background: #1f1f1e !important;
+  --app-root-background: #1f1f1e !important;
+  --app-secondary-background: #1f1f1e !important;
+  --app-tool-background: #1f1f1e !important;
+  --app-header-background: #1f1f1e !important;
+  --app-input-background: #1f1f1e !important;
+  --app-input-secondary-background: #1f1f1e !important;
+  --app-menu-background: #1f1f1e !important;
+  --app-primary-foreground: #f8f8f6 !important;
+  --app-input-foreground: #f8f8f6 !important;
+  --app-input-secondary-foreground: #f8f8f6 !important;
+  --app-menu-foreground: #f8f8f6 !important;
+  --app-secondary-foreground: #bcbcb9 !important;
+  --app-secondary-text: #bcbcb9 !important;
+  --app-mention-chip-background: #3d312d !important;
+  --app-mention-chip-foreground: #e0a18b !important;
+  --incipit-mention-chip-background-hover: #493932 !important;
+  --app-monospace-font-family: Consolas, 'Courier New', monospace !important;
+}
+
+/* ============================================================
    Message container baseline.
 
    Keep the message surface opaque, remove background images, and avoid
@@ -569,10 +608,18 @@ details[data-incipit-thinking]:not([open]) > summary[data-incipit-thinking-summa
 [data-incipit-tool-use] [data-incipit-tool-summary] [data-incipit-tool-name] {
   color: inherit !important;
 }
-/* Restore a text cursor on the path span so it looks selectable, matching
-   the JS click-skip rule. */
-[data-incipit-tool-use] [data-incipit-tool-summary] [data-incipit-tool-name-secondary] {
+/* Restore a text cursor only on real path spans so they look selectable.
+   Host uses the same `toolNameTextSecondary*` class family for plain-text
+   fingerprints (Bash description, MCP query), so we key off
+   `data-incipit-tool-fullpath` — set either by `truncatePathSpan` when
+   text is visibly path-like, or by the fiber-backed path decorator when
+   the host renders only a basename. */
+[data-incipit-tool-use] [data-incipit-tool-summary] [data-incipit-tool-fullpath],
+[data-incipit-tool-use] [data-incipit-tool-summary] [class*="filePath_"] {
   cursor: text;
+}
+[data-incipit-tool-use] [data-incipit-tool-summary] [data-incipit-tool-openable="1"] {
+  cursor: pointer;
 }
 
 /* Host uses flex with a `flex: 1` plaintext span inside the title wrapper
@@ -588,8 +635,33 @@ details[data-incipit-thinking]:not([open]) > summary[data-incipit-thinking-summa
   flex: 0 0 auto !important;
 }
 
+/* Tool body collapse animation. CSS owns the resting collapsed state and the
+   timing curve; `setupToolFold` suppresses the first decorate snap in JS and
+   writes inline `max-height` only while a user-triggered fold is in flight. */
+[data-incipit-tool-use] [data-incipit-tool-body] {
+  /* Claude Code hides `.toolBodyWrapper_*` below 500px. Since incipit now owns
+     the fold state, keep the body in layout and let max-height perform the
+     collapse; otherwise the chevron can open while the diff stays display:none. */
+  display: block !important;
+  overflow: hidden;
+  transition: max-height 0.22s ease,
+              margin-top 0.22s ease,
+              margin-bottom 0.22s ease,
+              padding-top 0.22s ease,
+              padding-bottom 0.22s ease;
+}
 [data-incipit-tool-use][data-incipit-tool-collapsed="true"] [data-incipit-tool-body] {
-  display: none !important;
+  max-height: 0;
+  /* Grid / flex children default to `min-height: auto` which can refuse to
+     shrink past their content's intrinsic size — force 0 so `max-height: 0`
+     actually wins. Same for any host-imposed border the container drew. */
+  min-height: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-top-width: 0;
+  border-bottom-width: 0;
 }
 
 /* Hide the host `secondaryLine` ("Modified" / "Added N lines") only when we
@@ -609,7 +681,7 @@ details[data-incipit-thinking]:not([open]) > summary[data-incipit-thinking-summa
   display: inline-flex;
   align-items: center;
   gap: 0.5em;
-  margin-left: 0.9em;
+  margin-left: 0.4em;
   font-family: inherit !important;
   font-variation-settings: initial !important;
   font-size: inherit;
@@ -646,6 +718,382 @@ details[data-incipit-thinking]:not([open]) > summary[data-incipit-thinking-summa
 
 [data-incipit-tool-use]:not([data-incipit-tool-collapsed="true"]) [data-incipit-tool-chevron] {
   transform: rotate(90deg);
+}
+
+/* Fallback fingerprint + collapsed/expanded label swap.
+
+   Decorate function in claude_code_enhance.js injects:
+   - `[data-incipit-tool-fingerprint]` only when host secondaryLine is empty
+     (PowerShell / LSP / many MCPs). Hidden when expanded.
+   - `[data-incipit-tool-fingerprint-label]` ('command' / 'pattern' / ...)
+     for every non-Edit/Write tool with a body. Hidden when collapsed.
+
+   Visibility is fully CSS-driven off `data-incipit-tool-collapsed`, so the
+   click-to-toggle in JS only flips one attr — no DOM churn per fold. */
+[data-incipit-tool-fingerprint] {
+  margin-left: 0.4em;
+  font-family: inherit;
+  font-variation-settings: initial;
+  font-style: normal;
+}
+/* Label is an abstract semantic word ('command' / 'pattern' / 'query'),
+   not user input — render it in the body serif so it reads like prose, not
+   a code token. */
+[data-incipit-tool-fingerprint-label] {
+  margin-left: 0.4em;
+  font-family: 'Reading', Georgia, 'Noto Sans SC', sans-serif !important;
+  font-variation-settings: initial;
+  font-style: normal;
+}
+
+/* Collapsed truncation: clip both host secondaryLine and our fallback at
+   ~60 ASCII chars (30em @ 13px body). `inline-block` + `vertical-align:
+   bottom` keeps it on the summary baseline without pushing line-height. */
+[data-incipit-tool-use][data-incipit-tool-collapsed="true"]:not([data-incipit-tool-has-stats="1"]) [data-incipit-tool-secondary],
+[data-incipit-tool-use][data-incipit-tool-collapsed="true"] [data-incipit-tool-fingerprint] {
+  display: inline-block;
+  max-width: 22em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+/* Expanded: only the fallback fingerprint hides (its label takes its place).
+   Host secondaryLine stays visible — we never wrote it, we only truncated
+   it when collapsed. Removing the collapsed-only `max-width` lets it flow
+   to its natural width again. */
+[data-incipit-tool-use]:not([data-incipit-tool-collapsed="true"]) [data-incipit-tool-fingerprint] {
+  display: none !important;
+}
+[data-incipit-tool-use][data-incipit-tool-collapsed="true"] [data-incipit-tool-fingerprint-label] {
+  display: none !important;
+}
+
+/* Grep takeover. The variant attr `data-incipit-tool-grep` is set by
+   `decorateToolUse` when `block.name === 'Grep'`. We replace the host's
+   two-row layout (`toolNameTextSecondary` row + `secondaryLine` row) with
+   our own single-line summary `Grep <fileName> <N lines> <chevron>` and
+   put the query detail in a foldable expansion div below. */
+
+/* Hide both host fingerprint nodes — we render our own. */
+[data-incipit-tool-use][data-incipit-tool-grep="1"] [data-incipit-tool-name-secondary],
+[data-incipit-tool-use][data-incipit-tool-grep="1"] [data-incipit-tool-secondary] {
+  display: none !important;
+}
+
+/* fileName: a serif span carrying the truncated `…\parent\basename`.
+   The terracotta dot underline mirrors the project link affordance so
+   it reads as a path and tooltip-bearing element, matching how
+   Edit/Write render their host-provided file paths. Uses `Emphasis`
+   (Plex Serif SemiBold) at weight 400 — same trick as headings — so
+   the path reaches the visual weight of host-provided Edit/Read paths
+   (which inherit a `font-weight: 600` from the host's filePath_*
+   class). Without this the grep filename reads markedly thinner than
+   sibling Edit/Read entries on the same row. */
+[data-incipit-tool-grep-filename] {
+  margin-left: 0.4em;
+  font-family: 'Emphasis', 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', serif;
+  font-weight: 400;
+  font-style: normal;
+  font-variation-settings: initial;
+  white-space: nowrap;
+  background-image:
+    radial-gradient(circle, rgba(217, 119, 87, 0.92) 1px, transparent 1.6px);
+  background-size: 7px 2px;
+  background-repeat: repeat-x;
+  background-position: 0 100%;
+  padding: 0 2px 2px;
+  margin-right: 2px;
+  border-radius: 2px;
+  transition: background-color 0.15s ease;
+}
+[data-incipit-tool-grep-filename]:hover {
+  background-color: rgba(217, 119, 87, 0.22);
+}
+[data-incipit-tool-use] [data-incipit-tool-summary]
+[data-incipit-tool-grep-filename][data-incipit-tool-grep-openable="1"] {
+  cursor: pointer;
+}
+
+/* aux: simplified count "N lines". Dim terracotta + !important so the
+   summary's hover-to-white rule (which lifts every child via `:hover *`)
+   does not strip the color. Same approach as +N/−M stats. */
+[data-incipit-tool-fingerprint-aux] {
+  margin-left: 0.5em;
+  color: #bc8c75 !important;
+  font-family: inherit;
+  font-style: normal;
+  font-variation-settings: initial;
+  white-space: nowrap;
+}
+
+/* Grep chevron: sits at the end of titleWrap. The chevron mask, color
+   transition, and rotation rules all come from `[data-incipit-tool-chevron]`
+   which we also set on this span. */
+[data-incipit-tool-grep-chevron] {
+  margin-left: 0.4em;
+  vertical-align: middle;
+}
+
+/* Expansion div — query detail, sibling of summary inside markdown-root.
+   Folds via `data-incipit-tool-collapsed`, animation driven by inline
+   max-height set by the click handler (matches toolBody behavior). */
+/* Expansion grid — IN row (query detail) + OUT row (lines count text we
+   removed from the summary). Mirrors the host's toolBodyGrid visual
+   without depending on host class names. */
+/* Expansion frame — rounded box, no fill, transparent inside. Padding is
+   pushed onto the rows so the rows themselves match the host's
+   `toolBodyGrid` cell metrics. */
+[data-incipit-tool-grep-expansion] {
+  overflow: hidden;
+  display: block;
+  margin-top: 0.4em;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  padding: 0;
+  transition: max-height 0.22s ease,
+              margin-top 0.22s ease,
+              margin-bottom 0.22s ease,
+              border-top-width 0.22s ease,
+              border-bottom-width 0.22s ease;
+}
+[data-incipit-tool-use][data-incipit-tool-grep="1"][data-incipit-tool-collapsed="true"] [data-incipit-tool-grep-expansion] {
+  max-height: 0;
+  min-height: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+  border-top-width: 0;
+  border-bottom-width: 0;
+}
+
+/* Row layout — auto-sized label column + 1fr content column. Mirrors
+   host's toolBodyRow grid (label cell, content cell). */
+[data-incipit-tool-grep-row] {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+}
+
+/* Label cell — values pulled from host's toolBodyRowLabel computed style:
+   11px Consolas (mono fallback), color #BCBCB9, padding 4px 8px 4px 4px. */
+[data-incipit-tool-grep-label] {
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: normal;
+  letter-spacing: 0;
+  color: #bcbcb9;
+  padding: 4px 8px 4px 8px;
+  white-space: nowrap;
+  text-align: left;
+}
+
+/* Content cell — same font as host's toolBodyRowContent (`<pre>`):
+   11px Consolas, color #F8F8F6, pre-wrap so long output stays readable. */
+[data-incipit-tool-grep-content] {
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #f8f8f6;
+  padding: 4px 8px 4px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* "+ N more lines" / "− show less" toggle for truncated grep output.
+   Block-level so it sits below the OUT body on its own line. Inherits
+   font/size from the OUT cell (mono 11px) so the visual weight matches
+   the surrounding code stream; italic + grey → hover near-white is the
+   only affordance, mirroring the summary-line interaction. cursor +
+   user-select keep it reading as a clickable label, not text. */
+[data-incipit-tool-grep-more] {
+  display: block;
+  margin-top: 6px;
+  font-family: inherit;
+  font-size: inherit;
+  font-style: italic;
+  color: #9c9c9a;
+  cursor: pointer;
+  user-select: none;
+  transition: color 120ms ease;
+}
+[data-incipit-tool-grep-more]:hover {
+  color: #f8f8f6;
+}
+
+/* ------------------------------------------------------------
+   Generic IN/OUT block — host shared template.
+
+   Applies to every tool whose body the host renders through its
+   `toolBodyGrid_ZUQaOA / toolBodyRow / toolBodyRowLabel /
+   toolBodyRowContent` template: Bash, PowerShell, LSP, MCP,
+   Read, TodoWrite, NotebookEdit, WebSearch, etc. The host's
+   default look uses no outer frame, only a faint hairline
+   between rows from `var(--app-input-border)` plus an `.85em`
+   monospace label at opacity 0.5 — visually distinct from our
+   Grep takeover (rounded frame + tight Rec Mono Linear at 11px).
+
+   Goal: bring this generic template in line with the Grep block
+   so every fold-out tool uses the same IN/OUT visual language.
+
+   Out of scope:
+   - Edit / MultiEdit Monaco diff blocks, plus Write's incipit-owned
+     empty-file diff island (both bypass the generic IN/OUT frame)
+   - Grep itself (renders its own `[data-incipit-tool-grep-*]`
+     subtree, host's `toolBodyGrid` never appears for it)
+
+   Layer-stripping (mandatory for clean look):
+   - Host paints THREE concentric surfaces by default:
+       1. `.toolBody_ZUQaOA`  — outer card (border + tool-bg +
+          radius:5 + margin:8 0)
+       2. `.toolBodyGrid_ZUQaOA`  — bare grid (no paint of its own)
+       3. `.toolResult_uq5aLg` — inner code-bg block, only in OUT,
+          stretched to 100% width
+     Stacking all three plus our own grid frame produced the
+     "two effects overlapping" look. Strip layer 1 (when it
+     contains a toolBodyGrid, so diff toolBody is untouched)
+     and layer 3 entirely; keep layer 2 as the single frame.
+   ------------------------------------------------------------ */
+[data-incipit-tool-use] [class*="toolBody_"]:has([class*="toolBodyGrid"]) {
+  border: 0 !important;
+  background: transparent !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+[data-incipit-tool-use] [class*="toolBodyGrid"] {
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  margin-top: 0.4em;
+  overflow: hidden;
+}
+[data-incipit-tool-use] [class*="toolResult_"] {
+  background: transparent !important;
+}
+[data-incipit-tool-use] [class*="toolBodyRow"] {
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  padding: 0;
+}
+[data-incipit-tool-use] [class*="toolBodyRow"]:first-child {
+  border-top: none;
+}
+[data-incipit-tool-use] [class*="toolBodyRowLabel"] {
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace;
+  font-size: 11px;
+  font-weight: normal;
+  font-style: normal;
+  letter-spacing: 0;
+  color: #bcbcb9;
+  opacity: 1;
+  padding: 4px 8px 4px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+[data-incipit-tool-use] [class*="toolBodyRowContent"] {
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #f8f8f6;
+  padding: 4px 8px 4px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* Host nests `<pre>` and inline `<code>` inside the content cell with
+   their own 0.85em / mono fallbacks — pin both to the same 11px so the
+   inner code stream does not jump a font size mid-row. Also strip any
+   inherited surface (chat-bg `pre { background: #272727 }` from the
+   markdown-root rule, hljs theme `.hljs { background: ... }`, host's
+   `--app-code-background` painter on toolResult, and the global
+   `pre { margin: 1em 0 }` that creates a phantom inner panel). */
+[data-incipit-tool-use] [class*="toolBodyRow"],
+[data-incipit-tool-use] [class*="toolBodyRowLabel"],
+[data-incipit-tool-use] [class*="toolBodyRowContent"],
+[data-incipit-tool-use] [class*="toolBodyRowContent"] pre,
+[data-incipit-tool-use] [class*="toolBodyRowContent"] code,
+[data-incipit-tool-use] [class*="toolResult_"] {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+[data-incipit-tool-use] [class*="toolBodyRowContent"] pre,
+[data-incipit-tool-use] [class*="toolBodyRowContent"] code {
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: inherit;
+  margin: 0 !important;
+}
+
+/* Strip the host's `max-height: 60px` + linear-gradient `mask-image`
+   clip on every toolBodyRowContent. The host caps OUT at four lines
+   and fades the rest with a gradient; that fights the toolBody fold
+   (expanding the body still leaves OUT clipped) and reads as modern
+   SaaS rather than the literary register the project targets.
+   We replace it with our own opt-in clip below, identical in shape
+   to the Grep "+ N more lines" toggle. */
+[data-incipit-tool-use] [class*="toolBodyRowContent"] {
+  max-height: none !important;
+  mask-image: none !important;
+  -webkit-mask-image: none !important;
+  overflow: visible !important;
+}
+
+/* Our truncation clip. Set by `applyToolRowTruncation` on the inner
+   <pre> (IN cell) or `toolResult_*` wrapper (OUT cell) when content
+   exceeds 15 lines / 3000 chars. 18em at 11px font-size = 198px ≈
+   12 lines × 1.5 line-height. Toggle button is a sibling of the
+   clip target inside the cell, so overflow:hidden never swallows it. */
+[data-incipit-tool-use] [data-incipit-tool-out-clipped="1"] {
+  display: block;
+  max-height: 18em;
+  overflow: hidden;
+}
+
+/* Toggle button — mirrors the Grep "more / show less" affordance so
+   every fold-out tool speaks the same UI vocabulary. Block-level so
+   it sits below the clipped pre on its own line. Inherits font from
+   the cell (Rec Mono 11px) so weight matches the surrounding stream;
+   italic + grey → hover near-white is the only affordance. */
+[data-incipit-tool-out-more] {
+  display: block;
+  margin-top: 6px;
+  font-family: inherit;
+  font-size: inherit;
+  font-style: italic;
+  color: #9c9c9a;
+  cursor: pointer;
+  user-select: none;
+  transition: color 120ms ease;
+}
+[data-incipit-tool-out-more]:hover {
+  color: #f8f8f6;
+}
+
+/* Generic injected file path for tools whose host renderer does not place
+   a clickable filename in the header (fallback MultiEdit / file-like MCP or
+   LSP shapes). Native Read/Edit/Write anchors keep their host markup; this
+   span is only for missing header paths. */
+[data-incipit-tool-filepath] {
+  margin-left: 0.4em;
+  font-family: 'Emphasis', 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', serif;
+  font-weight: 400;
+  font-style: normal;
+  font-variation-settings: initial;
+  white-space: nowrap;
+  background-image:
+    radial-gradient(circle, rgba(217, 119, 87, 0.92) 1px, transparent 1.6px);
+  background-size: 7px 2px;
+  background-repeat: repeat-x;
+  background-position: 0 100%;
+  padding: 0 2px 2px;
+  margin-right: 2px;
+  border-radius: 2px;
+  transition: background-color 0.15s ease;
+}
+[data-incipit-tool-filepath]:hover {
+  background-color: rgba(217, 119, 87, 0.22);
 }
 
 /* Path truncation tooltip.
@@ -700,6 +1148,815 @@ details[data-incipit-thinking]:not([open]) > summary[data-incipit-thinking-summa
   opacity: 1;
 }
 
+/* ============================================================
+   Inline diff editor.
+
+   Host Edit diffs are rendered by Monaco's diff editor. Claude Code 2.1.x
+   hard-codes `theme: "vs-dark"` in both inline and expanded diff editors;
+   install.js now patches those options to use incipit's bundled GitHub-like
+   Monaco themes plus Rec Mono Linear. This CSS therefore owns only the
+   surrounding frame, exact surface colour, truncation affordance, and a few
+   border/shadow neutralizers. Syntax colours and diff bands belong to Monaco
+   again, but the theme data is shipped with incipit rather than relying on a
+   user-installed VS Code theme.
+
+   Scope stays on the host's distinctive CSS-module stems:
+   `diffEditorWrapper`, `diffEditorContainer`, `truncationGradient`,
+   `clickOverlay`, and `expandButton`. If the host renames these stems, the
+   diff simply falls back to Claude Code's original frame while the Monaco
+   theme patch still degrades independently.
+   ============================================================ */
+/* Diff variables live on BOTH the inline wrapper and the modal frame
+   so descendants resolve them in either context. The `:has()` clause
+   prevents non-diff modals (settings dialog etc.) from picking up
+   diff-flavoured colours. */
+:where(
+  [data-incipit-write-diff],
+  [data-incipit-write-diff-modal-content],
+  [class*="diffEditorWrapper"],
+  [class*="modalContent_"]:has([class*="diffEditorContainer"])
+) {
+  --incipit-diff-surface: #1f1f1e;
+  --incipit-diff-text: #f0eee8;
+  --incipit-diff-muted: #9c9c9a;
+  --incipit-diff-border: rgba(248, 246, 240, 0.12);
+  --incipit-diff-divider: rgba(248, 246, 240, 0.10);
+  --incipit-diff-shadow: rgba(0, 0, 0, 0.28);
+  --incipit-diff-header-bg: #2a2a28;
+  --incipit-diff-header-text: #d8d6ce;
+  --incipit-diff-header-border: rgba(248, 246, 240, 0.08);
+  --incipit-diff-gradient-start: rgba(31, 31, 30, 0);
+  --incipit-diff-overlay-hover: rgba(248, 246, 240, 0.045);
+  --incipit-diff-button-bg: #2c2c2a;
+  --incipit-diff-button-bg-hover: #333330;
+  --incipit-diff-button-text: #f8f8f6;
+  --incipit-diff-button-border: rgba(248, 246, 240, 0.14);
+  --incipit-diff-add-fg: #7cb27c;
+  --incipit-diff-del-fg: #c96a6a;
+  /* Line-bg values must match the Monaco theme tokens in install.js
+     (`diffEditor.insertedLineBackground` / `removedLineBackground`) so
+     our overlay gutter, Monaco's hidden margin row decorations, and
+     Monaco's view-overlays code rows all blend to the same shade over
+     `--incipit-diff-surface`. Char-level deep tints come from Monaco's
+     `*TextBackground` tokens directly; we don't paint them in CSS. */
+  --incipit-diff-add-line: #23863633;
+  --incipit-diff-del-line: #da363333;
+  --incipit-diff-add-char: #2ea04366;
+  --incipit-diff-del-char: #f8514966;
+  --incipit-diff-add-border: rgba(124, 178, 124, 0.35);
+  --incipit-diff-del-border: rgba(201, 106, 106, 0.35);
+  --incipit-diff-add-bar: #3fb950;
+  --incipit-diff-del-bar: #f85149;
+  --incipit-diff-overview: rgba(248, 246, 240, 0.04);
+  --incipit-diff-scrollbar-size: 9px;
+  --incipit-diff-scrollbar-track-x: var(--incipit-diff-header-bg);
+  --incipit-diff-scrollbar-track-y: var(--incipit-diff-surface);
+  --incipit-diff-scrollbar-thumb: var(--incipit-scrollbar-thumb, #3c3c3c);
+  --incipit-diff-scrollbar-thumb-hover: var(--incipit-scrollbar-thumb-hover, #5a5a5a);
+  --incipit-diff-scrollbar-thumb-active: var(--incipit-scrollbar-thumb-active, #6a6a6a);
+}
+
+/* Host tool bodies carry a generic border/background around every tool result.
+   For inline Monaco diffs that reads as the black rectangle users noticed.
+   The diff wrapper/header provide the local structure, so the generic frame is
+   removed only when a diff editor is present. */
+[data-incipit-tool-use] [data-incipit-tool-body]:has([class*="diffEditorWrapper"]),
+[data-incipit-tool-use] [data-incipit-tool-body]:has([data-incipit-write-diff]) {
+  border: 0 !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+
+/* Inline diff card. The host's Monaco diff stays mounted as a fallback, but
+   recognized Edit/MultiEdit/Write calls render through incipit's own island
+   so preview/detail behavior is consistent and no longer coupled to Monaco
+   DOM internals. */
+[class*="diffEditorWrapper"],
+[data-incipit-diff-island],
+[data-incipit-write-diff] {
+  box-sizing: border-box;
+  position: relative;
+  overflow: hidden;
+  border: 0;
+  border-radius: 5px;
+  background: var(--incipit-diff-surface);
+  background-color: var(--incipit-diff-surface);
+  box-shadow: none;
+}
+
+[class*="diffEditorWrapper"],
+[data-incipit-diff-island],
+[data-incipit-write-diff] {
+  isolation: isolate;
+}
+
+[data-incipit-tool-use][data-incipit-tool-diff-island="1"] [class*="toolBody_"] > :not([data-incipit-diff-island]),
+[data-incipit-tool-use][data-incipit-tool-write-diff="1"] [class*="toolBody_"] > :not([data-incipit-write-diff]) {
+  display: none !important;
+}
+
+[data-incipit-diff-header] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px;
+  pointer-events: none;
+  background: var(--incipit-diff-header-bg);
+  color: var(--incipit-diff-header-text);
+  border-bottom: 1px solid var(--incipit-diff-header-border);
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace;
+  font-variation-settings: "MONO" 1, "CASL" 0, "slnt" 0;
+  font-size: 12px;
+  line-height: 1;
+}
+
+[data-incipit-diff-title] {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+[data-incipit-diff-counts] {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  margin-left: 2px;
+}
+
+[data-incipit-diff-island-body],
+[data-incipit-write-diff-body] {
+  display: block;
+  min-height: 1.55em;
+  overflow: hidden;
+  background: var(--incipit-diff-surface);
+  color: var(--incipit-diff-text);
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace;
+  font-variation-settings: "MONO" 1, "CASL" 0, "slnt" 0;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+[data-incipit-diff-island-row],
+[data-incipit-write-diff-row] {
+  display: grid;
+  grid-template-columns: 42px max-content;
+  min-width: 100%;
+  width: max-content;
+}
+
+[data-incipit-diff-island-row="add"],
+[data-incipit-write-diff-row="add"] {
+  background: var(--incipit-diff-add-line);
+  box-shadow: inset 3px 0 0 var(--incipit-diff-add-bar);
+}
+
+[data-incipit-diff-island-row="del"],
+[data-incipit-write-diff-row="del"] {
+  background: var(--incipit-diff-del-line);
+  box-shadow: inset 3px 0 0 var(--incipit-diff-del-bar);
+}
+
+[data-incipit-diff-island-row="ctx"],
+[data-incipit-write-diff-row="ctx"] {
+  background: var(--incipit-diff-surface);
+}
+
+[data-incipit-diff-island-number],
+[data-incipit-write-diff-number] {
+  display: block;
+  height: 1.55em;
+  line-height: 1.55;
+  padding-right: 6px;
+  text-align: right;
+  white-space: nowrap;
+  color: var(--vscode-editorLineNumber-foreground, var(--incipit-diff-muted));
+  font-feature-settings: "tnum" 1;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+[data-incipit-diff-island-pre],
+[data-incipit-write-diff-pre] {
+  grid-column: 2;
+  min-width: max-content;
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow: visible !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  border-radius: 0 !important;
+  white-space: pre !important;
+}
+
+[data-incipit-diff-island-code],
+[data-incipit-diff-island-code].hljs,
+[data-incipit-write-diff-code],
+[data-incipit-write-diff-code].hljs {
+  display: block;
+  min-width: max-content;
+  padding: 0 8px 0 0 !important;
+  overflow: visible !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  color: var(--incipit-diff-text);
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace !important;
+  font-variation-settings: "MONO" 1, "CASL" 0, "slnt" 0 !important;
+  font-size: 12px !important;
+  line-height: 1.55 !important;
+  white-space: pre !important;
+}
+
+[data-incipit-diff-island-char],
+[data-incipit-write-diff-char] {
+  border-radius: 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+[data-incipit-diff-island-char="add"],
+[data-incipit-write-diff-char="add"] {
+  background: var(--incipit-diff-add-char);
+  background-color: var(--incipit-diff-add-char);
+}
+
+[data-incipit-diff-island-char="del"],
+[data-incipit-write-diff-char="del"] {
+  background: var(--incipit-diff-del-char);
+  background-color: var(--incipit-diff-del-char);
+}
+
+[data-incipit-diff-island][data-incipit-write-diff-clipped="1"] [data-incipit-diff-island-body],
+[data-incipit-write-diff][data-incipit-write-diff-clipped="1"] [data-incipit-write-diff-body] {
+  max-height: var(--incipit-write-diff-preview-max-height, 24.8em);
+  overflow: hidden;
+}
+
+[data-incipit-write-diff-gradient] {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 4.8em;
+  pointer-events: none;
+  background:
+    linear-gradient(to bottom,
+      var(--incipit-diff-gradient-start) 0%,
+      var(--incipit-diff-surface) 100%);
+}
+
+[data-incipit-write-diff-expand] {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  z-index: 2;
+  padding: 4px 10px;
+  background: var(--incipit-diff-button-bg);
+  background-color: var(--incipit-diff-button-bg);
+  color: var(--incipit-diff-button-text);
+  border: 1px solid var(--incipit-diff-button-border);
+  border-radius: 4px;
+  font-family: 'Reading', Georgia, 'Noto Sans SC', sans-serif;
+  font-size: 12px;
+  line-height: 1.25;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+[data-incipit-write-diff-expand]:hover {
+  background: var(--incipit-diff-button-bg-hover);
+  background-color: var(--incipit-diff-button-bg-hover);
+  border-color: var(--incipit-diff-button-border);
+}
+
+[data-incipit-write-diff-expand]:focus-visible {
+  outline: 1px solid var(--incipit-diff-button-border);
+  outline-offset: 2px;
+}
+
+/* Short diff previews can still clip horizontally. They do not need the
+   bottom fade used by tall previews, so the full-view affordance lives in
+   the header as a small utility button. */
+[data-incipit-write-diff]:not([data-incipit-write-diff-clipped="1"]):has([data-incipit-write-diff-expand]) [data-incipit-diff-header] {
+  padding-right: 58px;
+}
+
+[data-incipit-write-diff]:not([data-incipit-write-diff-clipped="1"]) [data-incipit-write-diff-expand] {
+  left: auto;
+  right: 6px;
+  top: 4px;
+  bottom: auto;
+  transform: none;
+  z-index: 3;
+  padding: 2px 7px;
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+[data-incipit-write-diff-modal] {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4vh 4vw;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+[data-incipit-write-diff-modal-content] {
+  box-sizing: border-box;
+  width: min(960px, 92vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--incipit-diff-border);
+  border-radius: 8px;
+  background: var(--incipit-diff-surface);
+  background-color: var(--incipit-diff-surface);
+  box-shadow: 0 8px 32px var(--incipit-diff-shadow);
+}
+
+[data-incipit-write-diff-modal-header] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  height: 36px;
+  flex: 0 0 auto;
+  padding: 0 10px;
+  background: var(--incipit-diff-header-bg);
+  color: var(--incipit-diff-header-text);
+  border-bottom: 1px solid var(--incipit-diff-header-border);
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace;
+  font-variation-settings: "MONO" 1, "CASL" 0, "slnt" 0;
+  font-size: 12px;
+  line-height: 1;
+}
+
+[data-incipit-write-diff-modal-title] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+[data-incipit-write-diff-modal-close] {
+  margin-left: auto;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--incipit-diff-header-text);
+  font-family: Georgia, serif;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+[data-incipit-write-diff-modal-close]:hover {
+  background: var(--incipit-diff-overlay-hover);
+}
+
+[data-incipit-write-diff-modal-scroll] {
+  min-height: 0;
+  overflow: auto;
+  background: var(--incipit-diff-surface);
+}
+
+/* Detail modal owns scrolling. Preview bodies intentionally clip, but once
+   opened, the innermost diff body must not eat horizontal overflow; otherwise
+   the scroll container never sees long lines and no bottom scrollbar appears.
+   Also neutralize the global `pre { max-width:100% !important }` rule here. */
+[data-incipit-write-diff-modal-scroll] [data-incipit-diff-island-body],
+[data-incipit-write-diff-modal-scroll] [data-incipit-write-diff-body] {
+  width: max-content;
+  min-width: 100%;
+  overflow: visible;
+}
+
+[data-incipit-write-diff-modal-scroll] [data-incipit-diff-island-row],
+[data-incipit-write-diff-modal-scroll] [data-incipit-write-diff-row] {
+  width: max-content;
+  min-width: 100%;
+}
+
+[data-incipit-write-diff-modal-scroll] [data-incipit-diff-island-pre],
+[data-incipit-write-diff-modal-scroll] [data-incipit-write-diff-pre],
+[data-incipit-write-diff-modal-scroll] [data-incipit-diff-island-code],
+[data-incipit-write-diff-modal-scroll] [data-incipit-write-diff-code] {
+  width: max-content;
+  max-width: none !important;
+  overflow: visible !important;
+}
+
+/* Modal expanded diff frame: replace VS Code's `--app-input-border`
+   black stroke and `--app-primary-background` sidebar fill with our
+   warm graphite surface, mirroring the inline card treatment. */
+[class*="modalContent_"]:has([class*="diffEditorContainer"]) {
+  border: 1px solid var(--incipit-diff-border) !important;
+  border-radius: 8px !important;
+  background: var(--incipit-diff-surface) !important;
+  background-color: var(--incipit-diff-surface) !important;
+  box-shadow: 0 8px 32px var(--incipit-diff-shadow) !important;
+}
+
+/* Modal header bar (file path + close button). */
+[class*="modalContent_"]:has([class*="diffEditorContainer"]) [class*="modalHeader_"] {
+  border-bottom: 1px solid var(--incipit-diff-header-border) !important;
+  background-color: var(--incipit-diff-header-bg) !important;
+  color: var(--incipit-diff-header-text) !important;
+}
+
+[class*="modalContent_"]:has([class*="diffEditorContainer"]) [class*="modalTitle_"],
+[class*="modalContent_"]:has([class*="diffEditorContainer"]) [class*="iconButton_"] {
+  color: var(--incipit-diff-header-text) !important;
+}
+
+/* Modal backdrop dim — keep the host's veiled overlay but tone it with
+   our graphite shadow alpha instead of pure VS Code primary. */
+[class*="modalBackdrop_"]:has([class*="diffEditorContainer"]) {
+  background-color: rgba(0, 0, 0, 0.45) !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [class*="diffEditorContainer"] {
+  border-radius: 5px !important;
+  background: var(--incipit-diff-surface) !important;
+  background-color: var(--incipit-diff-surface) !important;
+}
+
+/* Confine our diff overlays' z-index inside the wrapper so they do not
+   escape to the document root and paint above the chat input.
+
+   Reverse-engineered: host CSS gives `.diffEditorWrapper_s6OFow` only
+   `position: relative; grid-column: 1/-1; width: 100%` — relative without
+   z-index does NOT create a stacking context. Our
+   `[data-incipit-diff-bars]` (z-index 20) and
+   `[data-incipit-diff-line-numbers]` (z-index 21) therefore stack at the
+   nearest real context root (effectively the document) and beat
+   `.inputFooter_*` (z-index 6), `.messageInput_*` (z-index 1), and the
+   z-index:auto `.inputContainer_*` — visible as line numbers floating on
+   top of the input box once the message scrolls behind it.
+
+   `isolation: isolate` creates a stacking context with no layout side
+   effects (unlike `transform: translateZ(0)`, which can also induce a
+   containing block for fixed descendants). Our z-indexes are now compared
+   only inside the wrapper; the wrapper itself sits at z-index auto in
+   document order, naturally below the input container's stack. */
+[class*="diffEditorWrapper"]:has([data-incipit-diff-header]) [class*="diffEditorContainer"] {
+  border-radius: 0 0 5px 5px !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor {
+  --vscode-editor-background: var(--incipit-diff-surface) !important;
+  --vscode-editorGutter-background: var(--incipit-diff-surface) !important;
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace !important;
+  font-variation-settings: "MONO" 1, "CASL" 0, "slnt" 0 !important;
+  --vscode-diffEditor-border: var(--incipit-diff-divider, var(--incipit-diff-border)) !important;
+  --vscode-diffEditor-insertedTextBorder: transparent !important;
+  --vscode-diffEditor-removedTextBorder: transparent !important;
+  --vscode-editor-lineHighlightBorder: transparent !important;
+  --vscode-editor-rangeHighlightBorder: transparent !important;
+  --vscode-editor-symbolHighlightBorder: transparent !important;
+  --vscode-editorWidget-border: var(--incipit-diff-border) !important;
+  --vscode-editorOverviewRuler-border: var(--incipit-diff-border) !important;
+  --vscode-panel-border: var(--incipit-diff-border) !important;
+  --vscode-scrollbar-shadow: transparent !important;
+  --vscode-scrollbarSlider-background: var(--incipit-scrollbar-thumb) !important;
+  --vscode-scrollbarSlider-hoverBackground: var(--incipit-scrollbar-thumb-hover) !important;
+  --vscode-scrollbarSlider-activeBackground: var(--incipit-scrollbar-thumb-active) !important;
+  outline: none !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor {
+  position: relative !important;
+  --incipit-diff-gutter-width: 42px;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor.side-by-side .editor.modified {
+  box-shadow: none !important;
+  border-left: 1px solid var(--incipit-diff-divider, var(--incipit-diff-border)) !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor.side-by-side .editor.original {
+  box-shadow: none !important;
+  border-right: 0 !important;
+}
+
+/* Preview and expanded modal diffs are patched to Monaco's single-column mode.
+   If Monaco leaves the collapsed original pane's width as a parent offset,
+   neutralize it so the visible code starts immediately after the incipit
+   line-number gutter. */
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]:has([class*="diffEditorContainer"]))
+.monaco-diff-editor:not(.side-by-side) .editor.modified {
+  left: 0 !important;
+  width: 100% !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .moved-blocks-lines {
+  display: none !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .overflow-guard,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .monaco-scrollable-element,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .view-overlays,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-scrollable-element .shadow {
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .view-line,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .view-line span {
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace !important;
+  font-variation-settings: "MONO" 1, "CASL" 0, "slnt" 0 !important;
+  font-weight: normal !important;
+  font-style: normal !important;
+  text-shadow: none !important;
+}
+
+/* Monaco's Markdown tokenizer can emit `.mtkb` / `.mtki` for `**strong**`
+   and `*emphasis*`, inherited from the built-in VS themes. A diff is source
+   code, not rendered Markdown: keep token colours, but never let token style
+   change weight/slant or draw source-level decoration over the diff fills. */
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .view-line .mtkb,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .view-line .mtki,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .view-line .mtku,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .view-line .mtks {
+  font-weight: normal !important;
+  font-style: normal !important;
+  text-decoration: none !important;
+}
+
+/* The generated Monaco theme owns the syntax colours and diff fills. CSS only
+   removes stray rectangle borders, then adds a slim high-contrast side rule
+   in Monaco's gutter margin. Character-level highlights stay fill-only. */
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .char-insert,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .char-delete,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .rangeHighlight,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .symbolHighlight,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .view-overlays .current-line,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .margin-view-overlays .current-line {
+  border-color: transparent !important;
+  border-style: none !important;
+  outline: none !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .line-insert {
+  border-top: 0 !important;
+  border-right: 0 !important;
+  border-bottom: 0 !important;
+  border-left: 0 !important;
+  outline: none !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .line-delete {
+  border-top: 0 !important;
+  border-right: 0 !important;
+  border-bottom: 0 !important;
+  border-left: 0 !important;
+  outline: none !important;
+}
+
+/* Keep `.gutter-insert/.gutter-delete` (Monaco's `marginClassName` for diff
+   rows) painting natively — the host stylesheet sets their bg to
+   `--vscode-diffEditor-insertedLineBackground/removedLineBackground` which
+   resolves to our generated Monaco theme tokens, identical to what
+   `.view-overlays .line-insert/.line-delete` paints in the code area.
+   Suppressing them here used to leave the margin row uncolored. We still
+   neutralize the inline view-zone bg shadow because those zones are used
+   for ghosted "deleted line" content inside the modified editor and should
+   not show a second-level fill. */
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .inline-added-margin-view-zone,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .inline-deleted-margin-view-zone,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .editor.original .inline-added-margin-view-zone,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .editor.original .inline-deleted-margin-view-zone,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .editor.modified .inline-added-margin-view-zone,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .editor.modified .inline-deleted-margin-view-zone {
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+
+/* Monaco's own stylesheet hardcodes `.lines-decorations { background: #fff }`
+   on the lineDecorations lane (where +/- glyphs sit). install.js now patches
+   the two diff editors with `lineDecorationsWidth:0`, which removes that lane
+   at the layout source. Keep this transparent override as defense for older
+   already-created editors or future host shapes where Monaco still emits the
+   lane before our option lands. */
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .lines-decorations {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+/* The far-left red/green side rule is our own overlay, not Monaco's gutter.
+   It is positioned by enhance.js from the visible changed rows inside
+   `.editor.modified`, so it lines up with the code the user is actually
+   reading while staying flush with the diff block edge. */
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [data-incipit-diff-bars] {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  pointer-events: none;
+  z-index: 20;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [data-incipit-diff-bar] {
+  position: absolute;
+  left: 0;
+  width: 3px;
+  min-height: 2px;
+  pointer-events: none;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [data-incipit-diff-bar="add"] {
+  background: var(--incipit-diff-add-bar);
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [data-incipit-diff-bar="del"] {
+  background: var(--incipit-diff-del-bar);
+}
+
+/* Monaco still owns the hidden native line-number gutters so enhance.js can
+   read their row positions, but the visible gutter is a single incipit layer
+   with real file line numbers from the extension host. */
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .editor.original .line-numbers,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .editor.modified .line-numbers {
+  color: transparent !important;
+  opacity: 0 !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .editor.modified .margin {
+  pointer-events: none !important;
+  background: transparent !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .editor.modified .monaco-scrollable-element {
+  left: var(--incipit-diff-gutter-width) !important;
+  width: calc(100% - var(--incipit-diff-gutter-width)) !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [data-incipit-diff-line-numbers] {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--incipit-diff-gutter-width, 42px);
+  pointer-events: none;
+  z-index: 21;
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace;
+  font-variation-settings: "MONO" 1, "CASL" 0, "slnt" 0;
+  font-feature-settings: "tnum" 1;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--vscode-editorLineNumber-foreground, var(--incipit-diff-muted));
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [data-incipit-diff-line-number] {
+  position: absolute;
+  left: 3px;
+  right: 0;
+  padding-right: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  white-space: nowrap;
+  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [data-incipit-diff-line-number="add"] {
+  background-color: var(--incipit-diff-add-line);
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [data-incipit-diff-line-number="del"] {
+  background-color: var(--incipit-diff-del-line);
+}
+
+
+/* Host also paints +/- line-decoration glyphs in the lane immediately before
+   the code text (`linesDecorationsClassName: "insert-sign/delete-sign"`).
+   With visible line numbers that produces a second red/green mark between
+   the number gutter and the code. Hide that lane marker; the high-contrast
+   signal belongs to the far-left Monaco margin via `.gutter-*` above. */
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .insert-sign,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .insert-sign,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [class*="codicon-diff-insert"],
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .delete-sign,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .delete-sign,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) [class*="codicon-diff-remove"] {
+  color: transparent !important;
+  opacity: 0 !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .diffOverview {
+  display: none !important;
+  width: 0 !important;
+  background: transparent !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .diffViewport {
+  display: none !important;
+  background: transparent !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-editor .decorationsOverviewRuler {
+  display: none !important;
+  width: 0 !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .scrollbar.horizontal {
+  height: var(--incipit-diff-scrollbar-size, 9px) !important;
+  background: var(--incipit-diff-scrollbar-track-x) !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .scrollbar.vertical {
+  width: var(--incipit-diff-scrollbar-size, 9px) !important;
+  background: var(--incipit-diff-scrollbar-track-y) !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .scrollbar.horizontal > .slider,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .scrollbar.vertical > .slider {
+  background: var(--incipit-diff-scrollbar-thumb) !important;
+  border-radius: 4px !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .scrollbar.horizontal > .slider:hover,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .scrollbar.vertical > .slider:hover {
+  background: var(--incipit-diff-scrollbar-thumb-hover) !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .scrollbar.horizontal > .slider.active,
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .scrollbar.vertical > .slider.active {
+  background: var(--incipit-diff-scrollbar-thumb-active) !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .scrollbar.horizontal > .slider {
+  top: 1px !important;
+  height: calc(var(--incipit-diff-scrollbar-size, 9px) - 2px) !important;
+}
+
+:where([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor .scrollbar.vertical > .slider {
+  left: 1px !important;
+  width: calc(var(--incipit-diff-scrollbar-size, 9px) - 2px) !important;
+}
+
+/* Inline diff is a preview card: clicking it opens the full diff view. Showing
+   scrollbars here suggests the preview itself is scrollable, so only the modal
+   detail view exposes the small horizontal/vertical sliders. */
+[class*="diffEditorWrapper"] .monaco-diff-editor .scrollbar.horizontal,
+[class*="diffEditorWrapper"] .monaco-diff-editor .scrollbar.vertical {
+  display: none !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+[class*="diffEditorWrapper"] [class*="truncationGradient"] {
+  background:
+    linear-gradient(to bottom,
+      var(--incipit-diff-gradient-start) 0%,
+      var(--incipit-diff-surface) 100%) !important;
+  border-radius: 0 0 5px 5px !important;
+}
+
+[class*="diffEditorWrapper"] [class*="clickOverlay"] {
+  border-radius: 5px !important;
+}
+
+[class*="diffEditorWrapper"] [class*="clickOverlay"]:hover {
+  background-color: var(--incipit-diff-overlay-hover) !important;
+}
+
+[class*="diffEditorWrapper"] [class*="expandButton"] {
+  background: var(--incipit-diff-button-bg) !important;
+  background-color: var(--incipit-diff-button-bg) !important;
+  color: var(--incipit-diff-button-text) !important;
+  border-color: var(--incipit-diff-button-border) !important;
+  border-radius: 4px !important;
+  font-family: 'Reading', Georgia, 'Noto Sans SC', sans-serif !important;
+  font-size: 12px !important;
+  line-height: 1.25 !important;
+  box-shadow: none !important;
+}
+
+[class*="diffEditorWrapper"] [class*="expandButton"]:hover {
+  background: var(--incipit-diff-button-bg-hover) !important;
+  background-color: var(--incipit-diff-button-bg-hover) !important;
+  border-color: var(--incipit-diff-button-border) !important;
+}
+
 /* Fenced code blocks. */
 pre code,
 .hljs,
@@ -735,6 +1992,22 @@ pre {
   background-color: transparent !important;
 }
 
+/* Keep the fenced-code box model identical before and after highlight.js.
+   The hljs theme is appended after theme.css and ships
+   `pre code.hljs { display:block; overflow-x:auto; padding:1em }`; if that
+   wins, the code block grows after tokenization and pushes everything below
+   it. The host already owns pre padding/scrolling, so the inner code element
+   must stay a zero-padding block in both states. */
+[data-incipit-markdown-root] pre code,
+[data-incipit-markdown-root] pre code.hljs,
+[data-incipit-message] [data-incipit-markdown-root] pre code,
+[data-incipit-message] [data-incipit-markdown-root] pre code.hljs {
+  display: block !important;
+  box-sizing: border-box !important;
+  padding: 0 !important;
+  overflow-x: visible !important;
+}
+
 /* Tool call bodies must not inherit the code-block tint — their own
    container already carries `--app-tool-background`. Two-attribute
    specificity beats the single-attribute `[data-incipit-markdown-root] pre`
@@ -763,6 +2036,29 @@ pre code {
   background: transparent !important;
   background-color: transparent !important;
   border: none !important;
+  color: inherit !important;
+}
+
+/* File/tool mention chips rendered inside messages. The host's default is a
+   VS Code blue slash-command badge; keep its inline geometry and only retone
+   it into the reading palette so sent `@file` references match composer
+   mentions. */
+[data-incipit-markdown-root] [class*="mentionChip"],
+[data-incipit-message] [class*="mentionChip"] {
+  background: var(--app-mention-chip-background) !important;
+  background-color: var(--app-mention-chip-background) !important;
+  color: var(--app-mention-chip-foreground) !important;
+}
+[data-incipit-markdown-root] [class*="mentionChip"]:hover,
+[data-incipit-message] [class*="mentionChip"]:hover {
+  background: var(--incipit-mention-chip-background-hover) !important;
+  background-color: var(--incipit-mention-chip-background-hover) !important;
+  color: var(--app-mention-chip-foreground) !important;
+  filter: none !important;
+}
+[data-incipit-markdown-root] [class*="mentionChip"] *,
+[data-incipit-message] [class*="mentionChip"] * {
+  background: transparent !important;
   color: inherit !important;
 }
 
@@ -915,7 +2211,12 @@ pre code {
   background-color: #2c2c2a !important;
   border: none !important;
   outline: none !important;
-  box-shadow: none !important;
+  /* Two-layer faint ambient shadow lifts the slightly-lighter input
+     surface (#2c2c2a) off the body bg (#1f1f1e). Same geometry as the
+     warm-white pair; alpha is bumped because dark surfaces need more
+     luminosity differential to register a halo. */
+  box-shadow: 0 2px 10px rgba(0,0,0,0.20),
+              0 1px 3px rgba(0,0,0,0.15) !important;
   --focus-ring-color: transparent !important;
   border-radius: 10px !important;
 }
@@ -925,9 +2226,163 @@ pre code {
   border-radius: 10px !important;
 }
 
+/* File drag reference hint.
+
+   incipit does not own the drop. It only adds a small composer-local hint
+   during file drag events that naturally reach the webview, pointing users to
+   the host's safe Shift-drag reference path. */
+[data-incipit-input-container] {
+  position: relative !important;
+  transition:
+    background-color 140ms ease,
+    box-shadow 140ms ease,
+    border-color 140ms ease !important;
+}
+[data-incipit-input-container][data-incipit-file-drag-hint="over"],
+[data-incipit-input-container][data-incipit-file-drag-hint="over"]:focus-within {
+  background: #302d2a !important;
+  background-color: #302d2a !important;
+  border-color: rgba(217,119,87,0.42) !important;
+  box-shadow: 0 6px 22px rgba(0,0,0,0.28),
+              0 1px 4px rgba(0,0,0,0.20),
+              inset 0 0 0 1px rgba(217,119,87,0.46) !important;
+}
+[data-incipit-input-container][data-incipit-file-drag-hint="over"] [data-incipit-input-container-bg] {
+  background: #302d2a !important;
+  background-color: #302d2a !important;
+}
+[data-incipit-input-container][data-incipit-file-drag-hint="over"]::after {
+  content: attr(data-incipit-file-drag-hint-text);
+  position: absolute;
+  pointer-events: none;
+  z-index: 5;
+  right: 12px;
+  top: 10px;
+  max-width: calc(100% - 24px);
+  box-sizing: border-box;
+  padding: 4px 8px 5px;
+  border-radius: 6px;
+  border: 1px solid rgba(217,119,87,0.36);
+  background: rgba(31,31,30,0.94);
+  color: rgba(248,248,246,0.78);
+  box-shadow: 0 4px 14px rgba(0,0,0,0.28);
+  font-family: 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+               system-ui, serif;
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: normal;
+}
+
+/* Shift-dropped file reference token inside the composer.
+   Keep the host's inline mention geometry intact. Changing display / overflow
+   on a contenteditable mention chip confuses Chromium's caret painting, so we
+   only retone the original blue badge into the input-card palette. */
+[data-incipit-input-container] [class*="inputMentionChip"] {
+  background: var(--app-mention-chip-background) !important;
+  background-color: var(--app-mention-chip-background) !important;
+  box-shadow:
+    -4px 0 0 var(--app-mention-chip-background),
+     4px 0 0 var(--app-mention-chip-background) !important;
+  color: var(--app-mention-chip-foreground) !important;
+}
+[data-incipit-input-container] [class*="inputMentionChip"]:hover {
+  background: var(--incipit-mention-chip-background-hover) !important;
+  background-color: var(--incipit-mention-chip-background-hover) !important;
+  box-shadow:
+    -4px 0 0 var(--incipit-mention-chip-background-hover),
+     4px 0 0 var(--incipit-mention-chip-background-hover) !important;
+  color: var(--app-mention-chip-foreground) !important;
+}
+[data-incipit-input-container] [class*="inputMentionChip"] * {
+  background: transparent !important;
+  color: inherit !important;
+}
+
 /* Remove the divider above the input footer. */
 [data-incipit-input-footer] {
   border-top: none !important;
+}
+
+/* ------------------------------------------------------------
+   Footer compression policy.
+
+   Host markup (V2):
+     [+]  [/]  | [filename pill (footerButtonInactive)]  <spacer>
+     [cceBadge | permission footerButtonPrimary] (container_8RAulQ
+       == data-incipit-input-footer-host)  [send]
+
+   The host footer is `display:flex; gap:6px; min-width:0` and
+   leaves every child at the default `flex-shrink: 1`. When the
+   IDE filename pill grows long the squeeze is distributed across
+   all peers — crushing the 26×26 icon buttons (add / slash /
+   send), our Ctx/Cache badge, and the permission-mode button so
+   far below icon size that the click target stops being usable.
+   The host's only relief is a `@media (max-width:300px)` rule
+   that hides labels — useless at the 350-500px sidebar widths
+   where the bug actually shows up.
+
+   Policy:
+   - cceBadge (Ctx + Cache) NEVER compresses
+   - the right-cluster wrapper holds cceBadge + permission button
+     as one unit so the cluster never undershoots its content
+   - icon-only buttons (add / slash / send) keep their 26×26 box
+   - the permission-mode button keeps icon-clickable width; its
+     label span is free to ellipsis or vanish via the host span
+     rules (`max-width:200px; min-width:0; text-overflow:ellipsis`)
+   - all compression flows to the IDE filename pill
+   ------------------------------------------------------------ */
+[data-incipit-input-footer] .cceBadge,
+[data-incipit-input-footer] [data-incipit-input-footer-host],
+[data-incipit-input-footer] [class*="sendButton"],
+[data-incipit-input-footer] [class*="menuButton"],
+[data-incipit-input-footer] [class*="addButtonContainer"] {
+  flex-shrink: 0 !important;
+}
+/* Permission button's natural min content is SVG 26 + padding-right 8
+   = 34px under border-box. Lock that as the floor so the icon
+   stays fully inside the click target even when the label is
+   ellipsed to nothing. */
+[data-incipit-input-footer] [data-incipit-input-footer-host] [class*="footerButton"] {
+  min-width: 34px !important;
+}
+
+/* Top chat-panel header (`.header_aqhumA` in 2.1.118).
+
+   Design intent: the chat panel is one continuous paper sheet from the
+   top of the title bar to the bottom of the chat body. The title bar is
+   a chapter heading, not a floating panel — so its surface matches the
+   body exactly, and a single ruled hairline beneath it carries all the
+   "this is where heading ends, content begins" weight. This is the
+   typographic vernacular of book pages and broadsheet papers.
+
+   The bottom input row keeps its own card surface (#2c2c2a / #ffffff)
+   — that asymmetry is intentional: the top bar is structural, the
+   input is a functional control and benefits from card affordance.
+
+   The host draws `border-bottom: 1px solid var(--app-primary-border-color)`
+   under the header, inheriting a near-black ruled line from VS Code's
+   sideBarActivityBarTop border. Replace it with a calibrated inset
+   hairline so the line is part of the header rather than a separate
+   1px element that would shift layout.
+
+   Selector strategy: `[class^="header_"]:has([class*="titleGroup"])`
+   uniquely identifies this header (the only `header_*` class that
+   contains a `titleGroup` child). Both names are CSS-module-hashed;
+   the `titleGroup` substring is distinctive enough to be stable
+   across host updates without needing a host_probe attribute.
+
+   Why INSET shadow: an outset `box-shadow: 0 1px 0 …` would render
+   into the body sibling's vertical space and be painted over by the
+   `messagesContainer_*` background that paints after the header in
+   flow order. Inset draws inside the header itself, behind its own
+   children but on top of its own background — guaranteed visible
+   regardless of sibling paint order. */
+[class^="header_"]:has([class*="titleGroup"]) {
+  border-bottom: none !important;
+  background: #1f1f1e !important;
+  background-color: #1f1f1e !important;
+  box-shadow: inset 0 -1px 0 rgba(0,0,0,0.55) !important;
 }
 
 /* Remove dividers around the attached-files container. */
@@ -937,10 +2392,45 @@ pre code {
   border-bottom: none !important;
 }
 
-/* Use the same flat fill treatment for menus and user bubbles. */
+/* Image-attachment chip (`.pill_lcdCYQ` in 2.1.118).
+
+   Host gives the chip a 1px solid border in `var(--app-input-border)`,
+   which inherits a near-black ruled stroke from VS Code's
+   `inlineChatInput-border` token. On both palettes that prints as a
+   hard CAD-utility outline, the same pattern we softened on popups,
+   tables, and the chat header. Replace the alpha with our standard
+   thin-divider tone (`rgba(255,255,255,0.10)` here, mirrored to
+   `rgba(0,0,0,0.10)` in `warm-white-override.css`) and bump the
+   corner radius from 4px to 6px so the chip relaxes one notch
+   without losing its "chip" identity.
+
+   Selector: `[class*="pill_"]:has([class*="thumbIcon"])` — the
+   thumbIcon child uniquely picks attachment chips while excluding
+   `.pill_LBSAWQ` and any future pill variants that don't carry a
+   thumbnail icon. Hover keeps the host's "deeper border" feedback
+   pattern, just retoned to soft alpha. */
+[class*="pill_"]:has([class*="thumbIcon"]) {
+  border-color: rgba(255,255,255,0.10) !important;
+  border-radius: 6px !important;
+}
+[class*="pill_"]:has([class*="thumbIcon"]):hover {
+  border-color: rgba(255,255,255,0.20) !important;
+}
+
+/* Use the same flat fill treatment for menus and user bubbles. The
+   host paints a 1px hairline border around the popup that reads as a
+   sharp edge against the cream/black surface; replace it with a soft
+   ambient drop shadow so the popup floats instead of being framed.
+   Same treatment applied to `[data-incipit-dropdown]` further down,
+   and matches the `.cceStatPopup` cache-detail surface. */
 [data-incipit-menu-popup] {
   background: #2c2c2a !important;
   background-color: #2c2c2a !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: 0 12px 36px rgba(0,0,0,0.55),
+              0 2px 8px rgba(0,0,0,0.35) !important;
+  border-radius: 10px !important;
 }
 [data-incipit-user-bubble] {
   background: #121212 !important;
@@ -951,10 +2441,20 @@ pre code {
   border-radius: 10px !important;
 }
 
-/* Interrupted messages are not real user bubbles. Keep them transparent. */
-[data-incipit-user-bubble]:has([data-incipit-interrupted-message]) {
+/* Interrupted messages are not real user bubbles. They may share the host's
+   user-message class chain, so cover both "contains interrupted" and "is the
+   interrupted node" shapes. */
+[data-incipit-interrupted-message],
+[data-incipit-user-bubble][data-incipit-interrupted-message],
+[data-incipit-user-bubble]:has([data-incipit-interrupted-message]),
+[data-incipit-user-message-container]:has([data-incipit-interrupted-message]),
+[data-incipit-user-message-container]:has([data-incipit-interrupted-message])
+  [data-incipit-user-layout-wrapper] {
   background: transparent !important;
   background-color: transparent !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
   border-radius: 0 !important;
 }
 
@@ -1014,13 +2514,16 @@ pre code {
   color: #F5F2E8 !important;
 }
 
-/* Match the conversation-history dropdown to the flat popup treatment. */
+/* Match the conversation-history dropdown to the flat popup treatment.
+   Shadow matches `[data-incipit-menu-popup]` and `.cceStatPopup` so
+   every floating surface in the webview lifts off the page the same way. */
 [data-incipit-dropdown] {
   background: #2c2c2a !important;
   background-color: #2c2c2a !important;
   border: none !important;
   outline: none !important;
-  box-shadow: none !important;
+  box-shadow: 0 12px 36px rgba(0,0,0,0.55),
+              0 2px 8px rgba(0,0,0,0.35) !important;
   border-radius: 10px !important;
 }
 
@@ -1158,6 +2661,620 @@ pre code {
 }
 .claude-user-copy-btn.copied {
   color: #C5B995;
+}
+
+.incipit-assistant-action-row {
+  display: flex;
+  justify-content: flex-start;
+  gap: 2px;
+  margin: 2px 0 8px 0;
+  padding: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+}
+[data-incipit-message]:hover > .incipit-assistant-action-row,
+.incipit-assistant-action-row:hover {
+  opacity: 1;
+  pointer-events: auto;
+}
+.incipit-transcript-action-row {
+  user-select: none;
+}
+/* Rerun (reprise arrow): terra orange in live state — this is the one
+   destructive-ish action in the row, the colour signals weight. */
+.incipit-transcript-action-rerun {
+  color: #d97757;
+}
+.incipit-transcript-action-rerun:hover {
+  color: #d97757;
+  background: rgba(217, 119, 87, 0.10);
+}
+.incipit-transcript-action-rerun svg {
+  width: 18px;
+  height: 18px;
+}
+/* Streaming-disabled state: edit (slash-overlay SVG) + rerun
+   (colour-only). Copy / more never disable. CSS suppresses hover
+   affordances so the disabled button reads as inert. */
+.incipit-transcript-action-btn[data-incipit-disabled="1"] {
+  cursor: default;
+  opacity: 0.6;
+}
+.incipit-transcript-action-btn[data-incipit-disabled="1"]:hover {
+  background: transparent !important;
+  color: inherit !important;
+}
+/* Rerun's disabled visual is purely colour: drop the terra accent
+   so the reprise arrow reads as a muted glyph identical to other disabled
+   icons in the row. */
+.incipit-transcript-action-rerun[data-incipit-disabled="1"] {
+  color: rgba(255, 255, 255, 0.45) !important;
+}
+.incipit-transcript-action-rerun[data-incipit-disabled="1"]:hover {
+  color: rgba(255, 255, 255, 0.45) !important;
+}
+/* Fork (git-branch Y): same colour-only disabled treatment as rerun.
+   Live state stays in body foreground (no terra accent — fork is
+   non-destructive and shouldn't compete with rerun's weight). */
+.incipit-transcript-action-fork svg {
+  width: 17px;
+  height: 17px;
+}
+.incipit-transcript-action-fork[data-incipit-disabled="1"] {
+  color: rgba(255, 255, 255, 0.45) !important;
+}
+.incipit-transcript-action-fork[data-incipit-disabled="1"]:hover {
+  color: rgba(255, 255, 255, 0.45) !important;
+}
+
+/* ============================================================
+   Hide the host's hover-popup rewind/fork actions on user
+   messages. We've covered both fork and rewind in the incipit
+   action row + More dropdown using the same SessionState /
+   AppContext APIs the host uses, so the hover popup is now a
+   visual duplicate that confuses users (two entry points for the
+   same destructive action).
+
+   Selector strategy: scope to user-message containers and target
+   the host's CSS-module-scoped actionButton / popup classes by
+   prefix. Failure is fail-open — if a future Claude Code release
+   renames these classes, the hide selector misses and the user
+   sees the host UI again. The incipit row keeps working
+   independently, so users never lose access to fork/rewind.
+   ============================================================ */
+[data-incipit-user-message-container] [class*="actionButton_"] {
+  display: none !important;
+}
+/* Popup is body-portaled so it's not under the user-message
+   container in the DOM tree — but with the trigger button hidden
+   the popup never opens. We do not try to hide the popup itself
+   to keep the host's confirmation modal (`<ea>` component, same
+   class graph) reachable from any future code path. */
+
+/* ============================================================
+   More-actions dropdown (Copy as text / Copy as markdown).
+   Body-portaled, fixed-position. Visual sits in the same family
+   as the host's menu_popup but written entirely from incipit
+   tokens so warm-white overrides are clean.
+   ============================================================ */
+[data-incipit-action-dropdown] {
+  position: fixed;
+  z-index: 4000;
+  min-width: 198px;
+  padding: 4px;
+  background: #2c2c2a !important;
+  background-color: #2c2c2a !important;
+  color: #F5F2E8;
+  border: none;
+  outline: none;
+  border-radius: 10px;
+  box-shadow: 0 12px 36px rgba(0,0,0,0.55),
+              0 2px 8px rgba(0,0,0,0.35);
+  font-family: 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+               system-ui, serif !important;
+  font-size: calc(var(--incipit-body-size, 13px) - 1px);
+  line-height: 1.45;
+}
+[data-incipit-action-dropdown-item] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  min-height: 31px;
+  padding: 5px 8px;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  color: inherit;
+  font-family: 'Emphasis', 'Reading', 'IBM Plex Serif', Georgia,
+               'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei',
+               system-ui, serif !important;
+  font-size: inherit;
+  line-height: inherit;
+  font-weight: 400;
+  cursor: pointer;
+}
+[data-incipit-action-dropdown-item]:hover,
+[data-incipit-action-dropdown-item]:focus {
+  background: #121212;
+  outline: none;
+}
+/* Disabled item: dim, kill hover, swallow clicks. Used for the
+   rewind/fork dropdown rows during streaming, and for fork-with-rewind
+   on the very first user message (no prevUuid). */
+[data-incipit-action-dropdown-item][data-incipit-disabled="1"] {
+  cursor: default;
+  opacity: 0.45;
+}
+[data-incipit-action-dropdown-item][data-incipit-disabled="1"]:hover,
+[data-incipit-action-dropdown-item][data-incipit-disabled="1"]:focus {
+  background: transparent !important;
+  outline: none;
+}
+/* Separator: 1px hairline grouping the rewind/fork block above and
+   the copy block below. Margin matches the popup's inner padding so
+   the rule sits flush with the rounded corners. */
+[data-incipit-action-dropdown-separator] {
+  height: 1px;
+  margin: 4px 2px;
+  background: rgba(245, 242, 232, 0.10);
+}
+[data-incipit-action-dropdown-icon] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  color: #F5F2E8;
+}
+[data-incipit-action-dropdown-icon] svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+[data-incipit-action-dropdown-label] {
+  min-width: 0;
+}
+
+/* ============================================================
+   Inline edit (replaces modal for editing user / AI messages).
+
+   Two visual treatments:
+     - assistant: warm "draft card" — subtle terra-red tint + soft
+       padding + small radius. Sits inside the message host's
+       content area; the host's left timeline (dot + connector)
+       stays untouched. NO marginalia rule (would clash with the
+       timeline visually).
+     - user: the bubble itself becomes the draft card by expanding
+       to the message container's full horizontal width. Cancel/save
+       sit inside the bubble at bottom-right.
+
+   Originals (markdown root + icon row) are kept in DOM and hidden
+   via data-incipit-inline-edit-hidden — reconcile keeps believing
+   they're decorated and won't re-create them mid-edit.
+   ============================================================ */
+[data-incipit-inline-edit-hidden] {
+  display: none !important;
+}
+/* Shell: must override any flex/grid the host may apply to the
+   markdown root's parent. Aggressive width:100% + align-self:stretch
+   + flex:1 1 auto covers block, flex-row, and flex-column parents
+   (without these, a flex parent with align-items:flex-start would
+   shrink-wrap the shell and our textarea would wrap at ~30 chars). */
+.incipit-inline-edit-shell {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  align-self: stretch;
+  flex: 1 1 auto;
+  position: relative;
+  margin: 0;
+  padding: 0;
+  animation: incipit-inline-edit-fade-in 120ms ease-out;
+}
+/* AI: draft card reuses the in-message code-block surface so the
+   editor reads as the same family of "embedded content surface" as
+   <pre> blocks — one step lighter than the chat background. Light
+   padding + small radius give it the same shape as a code block. */
+[data-incipit-inline-edit-shell="assistant"] {
+  background: #272727;
+  padding: 8px 10px;
+  border-radius: 4px;
+}
+/* User: no shell chrome of its own — the (expanded) bubble carries
+   the visual identity. */
+[data-incipit-inline-edit-shell="user"] {
+  background: transparent;
+  padding: 0;
+}
+
+/* Edit hover preview — when the user hovers the AI's pencil icon,
+   paint the markdown root with the same draft-card background the
+   inline-edit shell uses on click. Acts as a "dry run": you see
+   exactly what region edit-mode will turn into a draft card before
+   committing. JS toggles `data-incipit-edit-hover-preview` on the
+   markdown root in mouseenter/mouseleave on the edit button. The
+   transition smooths the colour appear/disappear so rapid mouse-overs
+   across the three icons read as a soft pulse, not a hard blink.
+   No padding here on purpose: padding would shift layout while the
+   icon row toggles, and the visible colour change alone is plenty of
+   affordance. User bubbles already carry the draft-card colour at
+   rest, so this rule does not need a user-side counterpart. */
+[data-incipit-markdown-root] {
+  transition: background-color 0.18s ease;
+  border-radius: 4px;
+}
+[data-incipit-markdown-root][data-incipit-edit-hover-preview] {
+  background-color: #272727;
+}
+
+@keyframes incipit-inline-edit-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.incipit-inline-edit-textarea {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  min-height: 1.68em;
+  resize: none;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: var(--incipit-body-size, 13px);
+  line-height: 1.68;
+  padding: 0;
+  margin: 0;
+  caret-color: #d97757;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+}
+.incipit-inline-edit-textarea:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+/* User bubble in edit mode: expand to fill the message container's
+   horizontal space. Drops the natural shrink-to-content behavior so
+   the textarea has room to write. The bubble itself becomes the
+   draft card; no extra chrome needed.
+
+   Every layer between container and textarea must be forced to
+   stretch — the host's expandableContainer (= [data-incipit-user-
+   expandable]) shrink-wraps to userContent's natural width by
+   default, and once userContent is hidden the wrapper collapses
+   to the textarea's empty intrinsic width, leaving the bubble
+   wide but the editable area narrow. */
+[data-incipit-user-message-container][data-incipit-inline-editing="user"] {
+  width: 100%;
+  max-width: 100%;
+  align-self: stretch;
+}
+[data-incipit-user-message-container][data-incipit-inline-editing="user"] [data-incipit-user-bubble] {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  box-sizing: border-box !important;
+  flex: 1 1 auto;
+  align-self: stretch;
+}
+[data-incipit-user-message-container][data-incipit-inline-editing="user"] [data-incipit-user-expandable],
+[data-incipit-user-message-container][data-incipit-inline-editing="user"] [data-incipit-inline-edit-shell="user"] {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  box-sizing: border-box !important;
+}
+[data-incipit-user-message-container][data-incipit-inline-editing="user"] .incipit-inline-edit-textarea {
+  width: 100% !important;
+  max-width: 100% !important;
+}
+
+/* Edit-state action row: same shape and spacing as the icon row it
+   replaces. Always visible while editing — committing to an action
+   is a primary affordance, not a hover-reveal. */
+.incipit-inline-edit-actions {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  justify-content: flex-start;
+  margin: 4px 0 8px 0;
+  padding: 0;
+  opacity: 1;
+  pointer-events: auto;
+  animation: incipit-inline-edit-fade-in 120ms ease-out;
+}
+/* User-bubble edit row lives inside the bubble — bottom-right,
+   matching the inline-edit reference where Cancel/Save sit at the
+   bottom-right of the dark draft container. */
+[data-incipit-inline-edit-actions="user"] {
+  justify-content: flex-end;
+  margin: 8px 0 0 0;
+  padding: 0;
+}
+/* Save button — primary commit affordance, terra-red. The base
+   `.incipit-transcript-action-btn[data-incipit-disabled="1"]:hover`
+   rule above sets `color: inherit !important` which would wash out
+   the terra hue on disabled-hover; override here so the dim save
+   keeps reading as save. */
+.incipit-transcript-action-save {
+  color: rgba(217, 119, 87, 0.92);
+}
+.incipit-transcript-action-save:hover {
+  color: #e3937a;
+  background: rgba(255, 255, 255, 0.06);
+}
+.incipit-transcript-action-save[data-incipit-disabled="1"]:hover {
+  background: transparent !important;
+  color: rgba(217, 119, 87, 0.92) !important;
+}
+/* Inflight (request fired, awaiting host response): freeze the button
+   so a double-click won't double-submit or cancel mid-flight. Used by
+   inline editor save/cancel and by rerun while truncate IPC is in
+   flight. The generic .incipit-transcript-action-btn rule covers all
+   future action buttons that opt in via data-incipit-inflight. */
+.incipit-transcript-action-btn[data-incipit-inflight="1"] {
+  pointer-events: none;
+  opacity: 0.5;
+}
+
+/* ---- Inline editor chip strip (user kind only) ----
+   Chip strip sits above the textarea inside the user-bubble edit
+   shell. Each chip represents a kept non-prose block (ide_*) or an
+   image attachment; X removes it. Image chips are thumbnail-only
+   with an overlaid X. The '+' button at the right end opens a file
+   picker for adding new images (paste & drop on the shell also work). */
+.incipit-edit-chip-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 8px 0;
+  padding: 0;
+  align-items: center;
+}
+.incipit-edit-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 4px 3px 7px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #bcbcb9;
+  font-family: 'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  max-width: 240px;
+  vertical-align: middle;
+  /* Animate chip removal: when JS replaceChildren wipes the strip
+     the new layout is computed instantly; this purely smooths the
+     in-mount fade so add-image doesn't pop harshly. */
+  animation: incipit-inline-edit-fade-in 140ms ease-out;
+}
+.incipit-edit-chip-icon {
+  display: inline-flex;
+  width: 13px;
+  height: 13px;
+  flex: 0 0 13px;
+  color: rgba(217, 119, 87, 0.85);
+}
+.incipit-edit-chip-icon svg { width: 100%; height: 100%; display: block; }
+.incipit-edit-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 160px;
+}
+.incipit-edit-chip-sub {
+  font-size: 10px;
+  opacity: 0.72;
+  white-space: nowrap;
+  padding-left: 1px;
+}
+.incipit-edit-chip-x {
+  background: none;
+  border: none;
+  padding: 0;
+  margin-left: 2px;
+  width: 14px;
+  height: 14px;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.incipit-edit-chip-x:hover { opacity: 1; }
+.incipit-edit-chip-x svg { width: 11px; height: 11px; display: block; }
+
+/* Image chip — thumbnail-only, overlaid X. Padding 0 lets the image
+   fill the chip; border becomes invisible since the image is its own
+   visual identity. Capping height at 32px keeps the chip strip
+   visually compact regardless of source image dimensions. */
+.incipit-edit-chip--image {
+  padding: 0;
+  height: 32px;
+  width: auto;
+  max-width: 96px;
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+  background: rgba(255, 255, 255, 0.06);
+  border-color: transparent;
+}
+.incipit-edit-chip-thumb {
+  height: 32px;
+  width: auto;
+  max-width: 96px;
+  object-fit: cover;
+  display: block;
+}
+.incipit-edit-chip--image .incipit-edit-chip-x {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #ffffff;
+  margin: 0;
+  opacity: 0.85;
+}
+.incipit-edit-chip--image .incipit-edit-chip-x svg { width: 9px; height: 9px; }
+.incipit-edit-chip--image .incipit-edit-chip-x:hover {
+  background: rgba(0, 0, 0, 0.72);
+  opacity: 1;
+}
+
+/* '+' add-image button — same height as a small chip, dashed border
+   so it reads as "empty slot ready for content" rather than a
+   committed object. Hover lifts to terra accent so it feels active. */
+.incipit-edit-chip-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 4px;
+  background: transparent;
+  border: 1px dashed rgba(255, 255, 255, 0.20);
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+}
+.incipit-edit-chip-add:hover {
+  border-color: rgba(217, 119, 87, 0.65);
+  color: rgba(217, 119, 87, 0.95);
+}
+.incipit-edit-chip-add svg { width: 14px; height: 14px; }
+
+/* ---- Image preview overlay (image chip click) ----
+   Body-portal modal that opens when the user clicks an image chip in
+   the inline editor. Same intent as the host composer's pill-click
+   preview (cf. host bundle H40), implemented as a vanilla DOM overlay
+   so it stays decoupled from the host React tree. The backdrop reads
+   as zoom-out cursor; the image itself stays default-cursor so it
+   doesn't masquerade as a closer. Z-index sits above dropdowns and
+   toasts (action dropdown 4000-ish, toast 5000) but below VS Code's
+   own modal layer. */
+[data-incipit-image-preview] {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.78);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  cursor: zoom-out;
+  animation: incipit-image-preview-fade 120ms ease-out;
+  outline: none;
+}
+[data-incipit-image-preview-img] {
+  max-width: 92vw;
+  max-height: 92vh;
+  object-fit: contain;
+  display: block;
+  cursor: default;
+  border-radius: 3px;
+  box-shadow: 0 8px 36px rgba(0, 0, 0, 0.55);
+  user-select: none;
+}
+[data-incipit-image-preview-close] {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  color: #ffffff;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.85;
+  padding: 0;
+}
+[data-incipit-image-preview-close]:hover {
+  background: rgba(0, 0, 0, 0.78);
+  opacity: 1;
+}
+[data-incipit-image-preview-close] svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+@keyframes incipit-image-preview-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+[data-incipit-tool-local-actions] {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.35em;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+  vertical-align: middle;
+}
+[data-incipit-tool-summary]:hover [data-incipit-tool-local-actions],
+[data-incipit-tool-local-actions]:hover {
+  opacity: 1;
+  pointer-events: auto;
+}
+[data-incipit-tool-local-actions] .claude-user-copy-btn {
+  width: 22px;
+  height: 22px;
+}
+[data-incipit-tool-local-actions] .claude-user-copy-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+[data-incipit-transcript-toast] {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 5000;
+  max-width: min(420px, calc(100vw - 36px));
+  padding: 9px 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(248,246,240,0.12);
+  background: #2c2c2a;
+  color: #f8f8f6;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.28);
+  font-family: 'Reading', 'IBM Plex Serif', Georgia, 'Noto Sans SC', 'Microsoft YaHei', serif;
+  font-size: var(--incipit-body-size, 13px);
+  line-height: 1.5;
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+  transition: opacity 0.16s, transform 0.16s;
+}
+[data-incipit-transcript-toast][data-visible="1"] {
+  opacity: 1;
+  transform: translateY(0);
+}
+[data-incipit-transcript-toast][data-kind="error"] {
+  border-color: rgba(201,106,106,0.42);
+  color: #ffd2cd;
 }
 
 /* ============================================================
@@ -1329,6 +3446,74 @@ pre code {
 }
 
 /* ============================================================
+   Effort brain icons.
+
+   The source art was generated as a five-step concept sheet from the
+   reference brain icon, then thresholded into black SVG line art. Production
+   keeps the five icons as plain external SVGs rather than bitmap assets, so
+   they stay crisp at 20px.
+   ============================================================ */
+/* Two-set ink approach: ship a black-ink and a white-ink SVG per level.
+   Warm-black (default) points the level vars at the white-ink files;
+   `warm-white-override.css` flips the same vars to the black-ink files.
+   We tried `filter: invert(1)` first — it forced the `::before` onto its
+   own composited layer and re-rasterized every paint, so during the
+   slider thumb's `transition` the brain icon dropped frames on warm-black
+   only. CSS filter is gone now; the URL swap is a single image load
+   per level change, no per-frame cost. */
+[class*="effortLabel"],
+[data-incipit-effort-label] {
+  --eb-low: url("effort-brain/effort-brain-low-white.svg");
+  --eb-med: url("effort-brain/effort-brain-medium-white.svg");
+  --eb-high: url("effort-brain/effort-brain-high-white.svg");
+  --eb-xhigh: url("effort-brain/effort-brain-xhigh-white.svg");
+  --eb-max: url("effort-brain/effort-brain-max-white.svg");
+  --incipit-effort-icon-current: var(--eb-med);
+}
+
+[data-incipit-effort-label][data-incipit-effort-level="low"] {
+  --incipit-effort-icon-current: var(--eb-low);
+}
+[data-incipit-effort-label][data-incipit-effort-level="medium"],
+[data-incipit-effort-label][data-incipit-effort-level="auto"] {
+  --incipit-effort-icon-current: var(--eb-med);
+}
+[data-incipit-effort-label][data-incipit-effort-level="high"] {
+  --incipit-effort-icon-current: var(--eb-high);
+}
+[data-incipit-effort-label][data-incipit-effort-level="xhigh"] {
+  --incipit-effort-icon-current: var(--eb-xhigh);
+}
+[data-incipit-effort-label][data-incipit-effort-level="max"] {
+  --incipit-effort-icon-current: var(--eb-max);
+}
+
+/* Live state source: host_probe writes the selected semantic level to
+   `data-incipit-effort-level`. Do not infer level from the slider thumb
+   percentage here: model-specific menus may omit levels, so a position like
+   0.5 or 1.0 is not globally equivalent to high/xhigh/max. */
+
+[class*="effortLabel"] > svg,
+[data-incipit-effort-label] > svg {
+  display: none !important;
+}
+
+[class*="effortLabel"]::before,
+[data-incipit-effort-label]::before {
+  content: "" !important;
+  display: inline-block !important;
+  flex: 0 0 20px !important;
+  width: 20px !important;
+  height: 20px !important;
+  background-color: transparent !important;
+  background-image: var(--incipit-effort-icon-current) !important;
+  background-size: contain !important;
+  background-position: center !important;
+  background-repeat: no-repeat !important;
+  vertical-align: -0.25em !important;
+}
+
+/* ============================================================
    Effort slider & thinking toggle — colour-only overrides.
 
    Only replace the host's blue accent with terracotta. Leave
@@ -1336,13 +3521,21 @@ pre code {
    nothing can break on upgrades.
    ============================================================ */
 
-/* Effort slider filled portion. */
-[data-incipit-menu-popup] [class*="fill_"] {
+/* Effort slider filled portion. The host module hash `fill_P1HaRA` is
+   unique to the slider component, so a global selector is safe and lets
+   sliders rendered outside the modes popup (none today, but future-proof)
+   pick up the warm camel without re-scoping. */
+[class*="fill_"] {
   background-color: #a8896e !important;
 }
 
-/* Thinking toggle track (on state). */
-[data-incipit-menu-popup] [class*="trackOn"] {
+/* Thinking + plugin-toggle ON track. The host reuses the same `0c4GDA`
+   toggle module across the modes popup *and* the Manage Plugins dialog
+   (and any future dialog), so this rule must NOT be scoped to
+   `[data-incipit-menu-popup]` — otherwise plugin toggles render with the
+   raw blue `--app-accent-color`. `trackOn_*` is unique to the toggle
+   component, no fallout. */
+[class*="trackOn"] {
   background-color: #a8896e !important;
 }
 
@@ -1351,3 +3544,305 @@ pre code {
   background-color: #a8896e !important;
 }
 
+/* ============================================================
+   Menu popup divider softening.
+
+   Two distinct host patterns paint section breaks inside popups:
+
+   1. `border-*` rules on inner rows (Context / Model). Soften the
+      alpha so the line reads as breath, not a drawn rule.
+   2. `.sectionDivider_*` block — a 1px-tall `<div>` whose colour
+      comes from `background: var(--app-input-border)`, NOT a
+      border. The selector below catches it and locks a stable
+      cream-on-ink line so the colour does not drift with the
+      user's VS Code theme. The light palette overrides the same
+      class in `warm-white-override.css` with a paper-toned alpha.
+   ============================================================ */
+[data-incipit-menu-popup] *,
+[data-incipit-dropdown] * {
+  border-color: rgba(255, 255, 255, 0.06) !important;
+}
+
+[class*="sectionDivider"],
+[class*="menuDivider"] {
+  background: rgba(248, 246, 240, 0.14) !important;
+  height: 2px !important;
+}
+
+/* ============================================================
+   Scrollbars — native Chromium scrollbars + Monaco virtual thumbs.
+
+   Claude Code uses both systems:
+   - the main chat list, input box, popups, permission panes, code
+     blocks, attachments, and session lists are plain overflow
+     containers painted by Chromium (`::-webkit-scrollbar`);
+   - Monaco editor widgets use real DOM virtual scrollbars
+     (`.monaco-scrollable-element > .scrollbar > .slider`).
+
+   The previous rule only covered Monaco, so most visible sliders
+   kept the host/default style. Keep this as a pure CSS fix: no
+   host_probe, no new anchors, and no JS observer.
+   ============================================================ */
+:root {
+  --incipit-scrollbar-thumb: #3c3c3c;
+  --incipit-scrollbar-thumb-hover: #5a5a5a;
+  --incipit-scrollbar-thumb-active: #6a6a6a;
+  --incipit-scrollbar-track: transparent;
+  --incipit-scrollbar-size: 10px;
+}
+
+* {
+  scrollbar-color: var(--incipit-scrollbar-thumb) var(--incipit-scrollbar-track) !important;
+}
+
+*::-webkit-scrollbar {
+  width: var(--incipit-scrollbar-size) !important;
+  height: var(--incipit-scrollbar-size) !important;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--incipit-scrollbar-track) !important;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--incipit-scrollbar-thumb) !important;
+  background-clip: padding-box !important;
+  border: 2px solid transparent !important;
+  border-radius: 999px !important;
+  min-height: 24px !important;
+  min-width: 24px !important;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--incipit-scrollbar-thumb-hover) !important;
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background-color: var(--incipit-scrollbar-thumb-active) !important;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent !important;
+}
+
+.monaco-scrollable-element > .scrollbar > .slider {
+  background: var(--incipit-scrollbar-thumb) !important;
+  border-radius: 4px !important;
+}
+.monaco-scrollable-element > .scrollbar > .slider:hover {
+  background: var(--incipit-scrollbar-thumb-hover) !important;
+}
+.monaco-scrollable-element > .scrollbar > .slider.active {
+  background: var(--incipit-scrollbar-thumb-active) !important;
+}
+
+/* ============================================================
+   Modal dialogs (slash-tool popups: Manage Plugins, Account
+   usage, MCP, Marketplaces, etc.)
+
+   The host ships five separate dialog CSS modules — `W2z5EA`
+   `f3sAzg` `yumWmQ` `5FHdxw` `ukWSlw`. Two of them
+   (`f3sAzg` + `yumWmQ`) paint a hard `--app-input-active-border`
+   blue ring on `:focus-within`, which reads as a stray system
+   focus rectangle on top of our flat-card popup language. The
+   rest paint a default border that lands as a near-black hairline
+   on the warm-white palette.
+
+   Strategy: treat every `[class*="dialog_"]` as a popup card —
+   match the `[data-incipit-menu-popup]` look (no border, big
+   ambient shadow, 10px radius). The light-mode mirror lives in
+   `warm-white-override.css`.
+   ============================================================ */
+[class*="dialog_"] {
+  background: #2c2c2a !important;
+  background-color: #2c2c2a !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: 0 12px 36px rgba(0,0,0,0.55),
+              0 2px 8px rgba(0,0,0,0.35) !important;
+  border-radius: 10px !important;
+}
+
+/* Kill the host's `:focus-within` blue accent ring. The default
+   `border: none` above wins on specificity, but the host rule
+   targets `border-color` directly which would otherwise paint a
+   1px coloured outline on whatever ancestor border was inherited.
+   Belt and braces: hold `border-color: transparent`. */
+[class*="dialog_"]:focus-within {
+  border-color: transparent !important;
+}
+
+/* Tone the modal backdrop. The host uses `--app-modal-background`
+   which the VS Code base already darkens, but on warm-white the
+   default reads as muddy gray. Dark mode keeps the deep veil. */
+[class*="overlay_"] {
+  background-color: rgba(0, 0, 0, 0.55) !important;
+}
+
+/* ============================================================
+   Manage Plugins dialog (host module `yumWmQ`).
+
+   Host rendering uses the system blue accent for: tab underline,
+   tab badge, primary action button (`Install`), and the on-state
+   plugin toggle. We keep host markup intact and re-skin via
+   substring selectors. Toggle ON colour is already handled by
+   the global `[class*="trackOn"]` rule above.
+   ============================================================ */
+
+/* Title — Reading serif, slightly looser to match other panel
+   titles. Host inherits `--app-primary-foreground` which is fine. */
+[class*="title_yumWmQ"] {
+  font-family: 'Reading', 'IBM Plex Serif', Georgia, 'Noto Sans SC', serif !important;
+  font-weight: 400 !important;
+  font-size: 14px !important;
+  letter-spacing: 0.005em !important;
+}
+
+/* Tab bar bottom rule — soften from full-strength border colour. */
+[class*="tabBar_yumWmQ"] {
+  border-bottom-color: rgba(255, 255, 255, 0.10) !important;
+}
+
+/* Active tab underline → terra accent instead of system blue. */
+[class*="tab_yumWmQ"][class*="active_yumWmQ"] {
+  border-bottom-color: #d97757 !important;
+  font-weight: 500 !important;
+}
+
+/* Tab count badge — flat warm chip instead of blue pill. */
+[class*="tabBadge_yumWmQ"] {
+  background-color: rgba(217, 119, 87, 0.18) !important;
+  color: #d97757 !important;
+  font-weight: 500 !important;
+}
+
+/* Search input — soften border, blend into dialog surface. */
+[class*="searchInput_yumWmQ"] {
+  background-color: rgba(0, 0, 0, 0.18) !important;
+  border-color: rgba(255, 255, 255, 0.08) !important;
+  color: #f8f8f6 !important;
+  font-family: 'Reading', 'IBM Plex Serif', Georgia, 'Noto Sans SC', serif !important;
+}
+[class*="searchInput_yumWmQ"]:focus {
+  border-color: rgba(217, 119, 87, 0.55) !important;
+  outline: none !important;
+}
+
+/* Section headers (INSTALLED / AVAILABLE) — keep typographic spec
+   but soften the underline rule. */
+[class*="sectionHeader_yumWmQ"] {
+  border-bottom-color: rgba(255, 255, 255, 0.08) !important;
+  letter-spacing: 0.08em !important;
+}
+
+/* Plugin item card — sit one notch deeper than the dialog so the
+   list has structure without painting hard borders. */
+[class*="pluginItem_yumWmQ"] {
+  background-color: rgba(0, 0, 0, 0.22) !important;
+  border-color: rgba(255, 255, 255, 0.06) !important;
+}
+[class*="pluginItem_yumWmQ"]:hover {
+  border-color: rgba(217, 119, 87, 0.40) !important;
+}
+
+/* Plugin name — Reading serif, weight 500 reads as semibold without
+   triggering Chromium synthetic bold (the @font-face already maps
+   500 to the SemiBold cut on warm-white-bold; on dark we sit on
+   400 cut at 500 weight which Plex tolerates). Keep the weight value
+   for the host's intended hierarchy but switch the family. */
+[class*="pluginName_yumWmQ"] {
+  font-family: 'Reading', 'IBM Plex Serif', Georgia, 'Noto Sans SC', serif !important;
+  font-weight: 500 !important;
+}
+
+/* Description and meta — let body cascade carry serif. */
+[class*="pluginDescription_yumWmQ"] {
+  font-family: 'Reading', 'IBM Plex Serif', Georgia, 'Noto Sans SC', serif !important;
+  line-height: 1.55 !important;
+  margin-top: 4px !important;
+}
+
+/* Generic action button — ghost. */
+[class*="actionButton_yumWmQ"] {
+  font-family: 'Reading', 'IBM Plex Serif', Georgia, 'Noto Sans SC', serif !important;
+  border-color: rgba(255, 255, 255, 0.16) !important;
+}
+[class*="actionButton_yumWmQ"]:hover {
+  background-color: rgba(255, 255, 255, 0.06) !important;
+}
+
+/* Primary action (Install) — terra accent, replaces system blue. */
+[class*="actionButton_yumWmQ"][class*="primary_yumWmQ"] {
+  background-color: #d97757 !important;
+  color: #1f1f1e !important;
+  border-color: transparent !important;
+  font-weight: 500 !important;
+}
+[class*="actionButton_yumWmQ"][class*="primary_yumWmQ"]:hover {
+  filter: brightness(1.08) !important;
+}
+
+/* Status dot — keep semantic green/grey but slightly desaturate. */
+[class*="statusDotEnabled_yumWmQ"] {
+  background-color: #6fb46f !important;
+}
+
+/* Install count text — soften further to keep focus on plugin name. */
+[class*="installCount_yumWmQ"] {
+  opacity: 0.7;
+}
+
+/* Source link in plugin meta — match the global accent underline
+   pattern (font colour stays inherited; underline is the affordance). */
+[class*="pluginMeta_yumWmQ"] a {
+  color: inherit !important;
+  text-decoration-color: rgba(217, 119, 87, 0.6) !important;
+}
+
+/* ============================================================
+   Inline keyboard hints — `<kbd>` chips inside slash-tool menu
+   headers (`menuHeaderHint_*`) and the conversation-history
+   shortcut hint (`keys_*`).
+
+   The host paints these via `var(--app-code-background)` /
+   `var(--app-input-border)`, which on our palette renders as
+   near-invisible. Re-skin as a quiet paper chip — keep affordance
+   readable, do not let the keyboard symbol shout over the menu
+   it is annotating.
+
+   Cross-platform glyph coverage (especially U+21E7 ⇧ which is
+   absent from most monospace fonts): the per-character font
+   fallback chain prefers our project mono, then a symbol-aware
+   font on each OS — `Segoe UI Symbol` (Windows), `Apple Symbols`
+   (macOS), `Noto Sans Symbols` (Linux), then mono fallbacks.
+   Browsers do per-glyph fallback so Latin tokens like `tab` stay
+   in Rec Mono while `⇧` reaches the symbol font.
+   ============================================================ */
+[class*="menuHeaderHint"] kbd,
+[class*="keys_"] kbd {
+  display: inline-block;
+  font-family: 'Rec Mono Linear', Consolas, Menlo, monospace !important;
+  font-size: 11.5px !important;
+  font-weight: 400 !important;
+  font-variant-ligatures: none !important;
+  letter-spacing: 0 !important;
+  line-height: 1.45 !important;
+  vertical-align: middle !important;
+  text-align: center !important;
+  min-width: 1.6em !important;
+  padding: 1px 6px !important;
+  margin: 0 1px !important;
+  border-radius: 3px !important;
+  background: rgba(248, 246, 240, 0.07) !important;
+  border: 1px solid rgba(248, 246, 240, 0.24) !important;
+  color: #f8f8f6 !important;
+  box-shadow: none !important;
+}
+
+/* The inline SVG injected by `setupKbdSymbols()` already sets its
+   own width/height/vertical-align inline, but make sure no inherited
+   stroke or font rule warps the path render. */
+[class*="menuHeaderHint"] kbd[data-incipit-kbd-svg="1"] svg,
+[class*="keys_"] kbd[data-incipit-kbd-svg="1"] svg {
+  stroke: none !important;
+}

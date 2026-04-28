@@ -2,9 +2,12 @@
 //
 // What gets backed up, and why the two categories are handled differently:
 //
-//   1. `extension.js` and `webview/index.js` live under Claude Code's
-//      extension directory and we rewrite them wholesale. For these,
-//      full-file snapshot + full-file restore is the correct operation.
+//   1. `extension.js` and the whole `webview/` directory live under
+//      Claude Code's extension directory. We rewrite `extension.js`, patch
+//      `webview/index.js`, and copy/prune many webview-side assets. For the
+//      extension payload, full snapshot +
+//      full restore is the only correct operation: restoring only the
+//      patched entry files would leave incipit-owned webview assets behind.
 //
 //   2. `settings.json` is VS Code's global user settings — shared with
 //      every other extension and every other user preference. We only
@@ -22,7 +25,7 @@
 //       <name>/                       user-supplied name, default "latest"
 //         manifest.json
 //         extension.js                (if it existed at backup time)
-//         webview_index.js            (ditto)
+//         webview_dir/                full pre-apply webview directory
 //       _history-<timestamp>/         auto-renamed when a name collides
 //
 // `_history-` prefix (leading underscore) is reserved for the collision
@@ -33,8 +36,9 @@
 // leaves either the old file or the new file intact, never a torn one.
 //
 // Verification: full-file entries carry a sha256 captured at backup
-// time. Restore recomputes the hash of the bytes it's about to write
-// and aborts that entry (counting it as a skip) if the hashes disagree.
+// time. Directory entries carry a sorted file list with sha256 hashes
+// plus empty-directory names. Restore verifies the backup bytes before
+// swapping anything into place and skips the entry if the hashes disagree.
 
 'use strict';
 
@@ -119,13 +123,137 @@ function moveDirSync(src, dst) {
   fs.rmSync(src, { recursive: true, force: true });
 }
 
+function toManifestPath(relPath) {
+  return relPath.split(path.sep).join('/');
+}
+
+function canonicalPath(p) {
+  if (!p) return '';
+  let out = path.resolve(p);
+  try { out = fs.realpathSync(out); } catch (_) {}
+  return process.platform === 'win32' ? out.toLowerCase() : out;
+}
+
+function samePath(a, b) {
+  return canonicalPath(a) === canonicalPath(b);
+}
+
+function manifestClaudeCodeVersion(manifest) {
+  return String(
+    manifest.claudeCodeVersion ||
+    manifest.extensionVersion ||
+    '',
+  );
+}
+
+function targetClaudeCodeVersion(target) {
+  return String(target && target.version ? target.version : '');
+}
+
+function isManifestCompatibleWithTarget(manifest, target) {
+  if (!target) return true;
+  const manifestVersion = manifestClaudeCodeVersion(manifest);
+  const targetVersion = targetClaudeCodeVersion(target);
+  if (manifestVersion && targetVersion && manifestVersion !== targetVersion) {
+    return false;
+  }
+  if (manifest.extensionDir && target.extensionDir &&
+      !samePath(manifest.extensionDir, target.extensionDir)) {
+    return false;
+  }
+  if (target.settingsPath && Array.isArray(manifest.entries)) {
+    const settingsEntry = manifest.entries.find(e =>
+      e && e.type === 'sparse_json' && e.logicalName === 'vscode_settings.json'
+    );
+    if (settingsEntry && settingsEntry.originalPath &&
+        !samePath(settingsEntry.originalPath, target.settingsPath)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function assertManifestCompatibleWithTarget(manifest, target) {
+  if (!target || isManifestCompatibleWithTarget(manifest, target)) return;
+  const manifestVersion = manifestClaudeCodeVersion(manifest) || 'unknown';
+  const targetVersion = targetClaudeCodeVersion(target) || 'unknown';
+  if (manifestVersion !== targetVersion) {
+    throw new Error(
+      `Backup belongs to Claude Code ${manifestVersion}; current target is ${targetVersion}.`,
+    );
+  }
+  throw new Error('Backup belongs to a different Claude Code target.');
+}
+
+// Recursively list a directory's exact shape. Directory entries are tracked
+// separately so an empty upstream directory can be restored as empty, not
+// silently dropped by a file-only manifest.
+function directoryShape(root) {
+  const files = [];
+  const dirs = [];
+  function walk(dir, rel) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      const childRel = rel ? path.join(rel, entry.name) : entry.name;
+      const manifestRel = toManifestPath(childRel);
+      if (entry.isDirectory()) {
+        dirs.push(manifestRel);
+        walk(full, childRel);
+      } else if (entry.isFile()) {
+        const buf = fs.readFileSync(full);
+        files.push({
+          path: manifestRel,
+          size: buf.length,
+          sha256: sha256Bytes(buf),
+        });
+      }
+    }
+  }
+  walk(root, '');
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  dirs.sort((a, b) => a.localeCompare(b));
+  return { files, dirs };
+}
+
+function directoryMatchesManifest(root, entry) {
+  if (!fs.existsSync(root)) return false;
+  let stat;
+  try { stat = fs.statSync(root); } catch (_) { return false; }
+  if (!stat.isDirectory()) return false;
+  let shape;
+  try { shape = directoryShape(root); } catch (_) { return false; }
+  const expectedFiles = entry.files || [];
+  const expectedDirs = entry.dirs || [];
+  if (shape.files.length !== expectedFiles.length ||
+      shape.dirs.length !== expectedDirs.length) {
+    return false;
+  }
+  for (let i = 0; i < expectedDirs.length; i += 1) {
+    if (shape.dirs[i] !== expectedDirs[i]) return false;
+  }
+  for (let i = 0; i < expectedFiles.length; i += 1) {
+    const actual = shape.files[i];
+    const expected = expectedFiles[i];
+    if (!actual || !expected) return false;
+    if (actual.path !== expected.path ||
+        actual.size !== expected.size ||
+        actual.sha256 !== expected.sha256) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // --------------------------- manifest I/O ---------------------------
 
 function writeManifest(backupDir, manifest) {
   const data = {
-    version: 2,                         // schema version, not extension version
+    version: 3,                         // schema version, not extension version
     created_at: manifest.createdAt,
     name: manifest.name,
+    claude_code_version: manifest.claudeCodeVersion || manifest.extensionVersion,
     extension_version: manifest.extensionVersion,
     extension_dir: manifest.extensionDir,
     entries: manifest.entries.map(serializeEntry),
@@ -145,6 +273,17 @@ function serializeEntry(e) {
       backup_file: e.backupFile,       // basename, relative to backup dir
       existed_before: e.existedBefore,
       sha256: e.sha256,
+    };
+  }
+  if (e.type === 'directory') {
+    return {
+      type: 'directory',
+      logical_name: e.logicalName,
+      original_path: e.originalPath,
+      backup_dir: e.backupDirName,
+      existed_before: e.existedBefore,
+      dirs: e.dirs || [],
+      files: e.files || [],
     };
   }
   if (e.type === 'sparse_json') {
@@ -178,6 +317,7 @@ function readManifest(backupDir) {
     schemaVersion:    data.version || 1,
     createdAt:        data.created_at || '',
     name:             data.name || path.basename(backupDir),
+    claudeCodeVersion: data.claude_code_version || data.extension_version || '',
     extensionVersion: data.extension_version || '',
     extensionDir:     data.extension_dir || '',
     entries,
@@ -209,6 +349,28 @@ function deserializeEntry(e, backupDir) {
       backupPath:    path.join(backupDir, e.backup_file),
       existedBefore: Boolean(e.existed_before),
       sha256:        e.sha256 || '',
+    };
+  }
+  if (e.type === 'directory') {
+    const backupDirName = path.basename(e.backup_dir || e.logical_name || '');
+    return {
+      type:          'directory',
+      logicalName:   e.logical_name,
+      originalPath:  e.original_path,
+      backupDirName,
+      backupPath:    path.join(backupDir, backupDirName),
+      existedBefore: Boolean(e.existed_before),
+      dirs:          Array.isArray(e.dirs) ? e.dirs.slice().sort() : [],
+      files:         Array.isArray(e.files)
+        ? e.files
+          .filter(f => f && typeof f.path === 'string')
+          .map(f => ({
+            path: f.path,
+            size: Number.isFinite(f.size) ? f.size : 0,
+            sha256: typeof f.sha256 === 'string' ? f.sha256 : '',
+          }))
+          .sort((a, b) => a.path.localeCompare(b.path))
+        : [],
     };
   }
   if (e.type === 'sparse_json') {
@@ -287,6 +449,39 @@ function snapshotFile(logicalName, src, backupDir) {
   };
 }
 
+function snapshotDirectory(logicalName, src, backupDir) {
+  const dst = path.join(backupDir, logicalName);
+  if (!fs.existsSync(src)) {
+    return {
+      type:          'directory',
+      logicalName,
+      originalPath:  src,
+      backupDirName: logicalName,
+      backupPath:    dst,
+      existedBefore: false,
+      dirs:          [],
+      files:         [],
+    };
+  }
+  const stat = fs.statSync(src);
+  if (!stat.isDirectory()) {
+    throw new Error(`Expected directory for backup: ${src}`);
+  }
+  if (fs.existsSync(dst)) fs.rmSync(dst, { recursive: true, force: true });
+  fs.cpSync(src, dst, { recursive: true, preserveTimestamps: true });
+  const shape = directoryShape(dst);
+  return {
+    type:          'directory',
+    logicalName,
+    originalPath:  src,
+    backupDirName: logicalName,
+    backupPath:    dst,
+    existedBefore: true,
+    dirs:          shape.dirs,
+    files:         shape.files,
+  };
+}
+
 function createBackup(target, opts = {}) {
   const name = sanitizeBackupName(opts.name);
   const versionDir = path.join(BACKUP_ROOT, String(target.version));
@@ -297,15 +492,17 @@ function createBackup(target, opts = {}) {
   }
   fs.mkdirSync(backupDir, { recursive: true });
 
+  const settingsPath = target.settingsPath || vscodeUserSettingsPath();
   const entries = [
     snapshotFile('extension.js',      target.extensionJsPath,     backupDir),
-    snapshotFile('webview_index.js',  target.webviewIndexJsPath,  backupDir),
-    snapshotSparseJson(vscodeUserSettingsPath(), Array.from(CHAT_FONT_SETTING_KEYS)),
+    snapshotDirectory('webview_dir',  path.dirname(target.webviewIndexJsPath), backupDir),
+    snapshotSparseJson(settingsPath, Array.from(CHAT_FONT_SETTING_KEYS)),
   ];
 
   const manifest = {
     createdAt:        new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
     name,
+    claudeCodeVersion: target.version,
     extensionVersion: target.version,
     extensionDir:     target.extensionDir,
     entries,
@@ -320,7 +517,8 @@ function currentBackupDir(target, name = DEFAULT_BACKUP_NAME) {
 
 // --------------------------- backup listing ---------------------------
 
-function listAvailableBackups() {
+function listAvailableBackups(options = {}) {
+  const target = options.target || null;
   const results = [];
   if (!fs.existsSync(BACKUP_ROOT)) return results;
   const versionDirs = fs.readdirSync(BACKUP_ROOT).filter(n => {
@@ -328,6 +526,7 @@ function listAvailableBackups() {
     catch (_) { return false; }
   });
   for (const vd of versionDirs) {
+    if (target && target.version && vd !== String(target.version)) continue;
     const vPath = path.join(BACKUP_ROOT, vd);
     const subDirs = fs.readdirSync(vPath).filter(n => {
       try { return fs.statSync(path.join(vPath, n)).isDirectory(); }
@@ -337,8 +536,9 @@ function listAvailableBackups() {
       const bd = path.join(vPath, sd);
       const m = readManifest(bd);
       if (!m) continue;
+      if (!isManifestCompatibleWithTarget(m, target)) continue;
       results.push({
-        label:     `v${m.extensionVersion} / ${sd}  (${m.createdAt})`,
+        label:     `v${manifestClaudeCodeVersion(m)} / ${sd}  (${m.createdAt})`,
         backupDir: bd,
         manifest:  m,
         sortKey:   m.createdAt || '',
@@ -353,13 +553,17 @@ function listAvailableBackups() {
 
 // --------------------------- restore ---------------------------
 
-function restoreBackup(manifest) {
+function restoreBackup(manifest, options = {}) {
+  assertManifestCompatibleWithTarget(manifest, options.target || null);
   let restored = 0;
   let skipped = 0;
   for (const e of manifest.entries) {
     try {
       if (e.type === 'file') {
         if (restoreFileEntry(e)) restored++;
+        else skipped++;
+      } else if (e.type === 'directory') {
+        if (restoreDirectoryEntry(e)) restored++;
         else skipped++;
       } else if (e.type === 'sparse_json') {
         if (restoreSparseJsonEntry(e)) restored++;
@@ -385,12 +589,58 @@ function restoreFileEntry(e) {
     return true;
   }
   // The file did not exist at backup time. If it exists now, delete it
-  // so the extension dir matches the pre-apply state. This only fires
-  // for the two patched JS files — settings.json is always a
-  // sparse_json entry and never takes this path.
+  // so the patched payload matches the pre-apply state. settings.json is
+  // always a sparse_json entry and never takes this path.
   if (fs.existsSync(e.originalPath)) {
     try {
       fs.unlinkSync(e.originalPath);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+  return false;
+}
+
+function restoreDirectoryEntry(e) {
+  if (e.existedBefore) {
+    if (!directoryMatchesManifest(e.backupPath, e)) return false;
+    fs.mkdirSync(path.dirname(e.originalPath), { recursive: true });
+
+    const parent = path.dirname(e.originalPath);
+    const base = path.basename(e.originalPath);
+    const stamp = `${process.pid}-${Date.now()}`;
+    const stage = path.join(parent, `.${base}.incipit-restore-${stamp}`);
+    const old = path.join(parent, `.${base}.incipit-old-${stamp}`);
+    try {
+      if (fs.existsSync(stage)) fs.rmSync(stage, { recursive: true, force: true });
+      if (fs.existsSync(old)) fs.rmSync(old, { recursive: true, force: true });
+      fs.cpSync(e.backupPath, stage, { recursive: true, preserveTimestamps: true });
+      if (!directoryMatchesManifest(stage, e)) {
+        fs.rmSync(stage, { recursive: true, force: true });
+        return false;
+      }
+      if (fs.existsSync(e.originalPath)) {
+        fs.renameSync(e.originalPath, old);
+      }
+      fs.renameSync(stage, e.originalPath);
+      if (fs.existsSync(old)) fs.rmSync(old, { recursive: true, force: true });
+      return true;
+    } catch (_) {
+      try {
+        if (!fs.existsSync(e.originalPath) && fs.existsSync(old)) {
+          fs.renameSync(old, e.originalPath);
+        }
+      } catch (_) {}
+      try { if (fs.existsSync(stage)) fs.rmSync(stage, { recursive: true, force: true }); } catch (_) {}
+      try { if (fs.existsSync(old)) fs.rmSync(old, { recursive: true, force: true }); } catch (_) {}
+      return false;
+    }
+  }
+
+  if (fs.existsSync(e.originalPath)) {
+    try {
+      fs.rmSync(e.originalPath, { recursive: true, force: true });
       return true;
     } catch (_) {
       return false;

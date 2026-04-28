@@ -1,0 +1,974 @@
+import { SEL } from './host_probe.js';
+import { renderMathInSegment as rewriteMathInSegment } from './math_rewriter.js';
+import { CFG, assetURL, loadCSS, loadJS, log, warn } from './enhance_shared.js';
+
+/**
+ * Typography, math DOM rendering, CJK punctuation, and code highlighting.
+ *
+ * This module intentionally talks to the legacy transcript/diff surface only
+ * through late-bound hooks. Bootstrap can import typography before or after
+ * the legacy module without losing math/CJK/code work; when legacy arrives it
+ * registers the richer transcript/copy callbacks and we seed one catch-up pass.
+ */
+
+const legacyHooks = {
+  conversationIsBusy: null,
+  noteTranscriptActionMutation: null,
+  scanAndAddCopyButtons: null,
+};
+
+function hook(name) {
+  const explicit = legacyHooks[name];
+  if (typeof explicit === 'function') return explicit;
+  const globalHooks = globalThis.__incipitLegacyHooks;
+  const globalHook = globalHooks && globalHooks[name];
+  return typeof globalHook === 'function' ? globalHook : null;
+}
+
+function conversationIsBusy() {
+  const fn = hook('conversationIsBusy');
+  if (!fn) return domConversationLooksBusy();
+  try { return !!fn(); }
+  catch (e) {
+    warn('conversationIsBusy hook failed:', e);
+    return domConversationLooksBusy();
+  }
+}
+
+function domConversationLooksBusy() {
+  try {
+    return !!document.querySelector('[data-incipit-send-state="stop"], ' + SEL.stopIcon);
+  } catch (_) {
+    return false;
+  }
+}
+
+function noteTranscriptActionMutation() {
+  const fn = hook('noteTranscriptActionMutation');
+  if (!fn) return;
+  try { fn(); }
+  catch (e) { warn('transcript mutation hook failed:', e); }
+}
+
+function scanAndAddCopyButtons(root, options = {}) {
+  const fn = hook('scanAndAddCopyButtons');
+  if (!fn) return;
+  try { fn(root, options); }
+  catch (e) { warn('copy/action scan hook failed:', e); }
+}
+
+export function configureTypographyHooks(hooks = {}) {
+  for (const key of Object.keys(legacyHooks)) {
+    if (typeof hooks[key] === 'function') legacyHooks[key] = hooks[key];
+  }
+}
+
+const assets = (() => {
+  let katexPromise = null;
+  let hljsPromise = null;
+
+  return {
+    katex() {
+      if (!katexPromise) {
+        katexPromise = Promise.all([
+          loadCSS(assetURL('katex/katex.min.css')),
+          loadJS(assetURL('katex/katex.min.js')),
+        ]).then(() => {
+          if (typeof window.katex === 'undefined') {
+            throw new Error('KaTeX loaded but window.katex missing');
+          }
+          log('KaTeX ready');
+        }).catch(e => { warn('KaTeX load failed:', e); throw e; });
+      }
+      return katexPromise;
+    },
+    hljs() {
+      if (!hljsPromise) {
+        const themeFile = CFG.palette === 'warm-white'
+          ? 'hljs/styles/vs.min.css'
+          : 'hljs/styles/vs2015.min.css';
+        hljsPromise = Promise.all([
+          loadCSS(assetURL(themeFile)),
+          loadJS(assetURL('hljs/highlight.min.js')),
+        ]).then(() => {
+          if (typeof window.hljs === 'undefined') {
+            throw new Error('hljs loaded but window.hljs missing');
+          }
+          log('highlight.js ready (' + themeFile + ')');
+        }).catch(e => { warn('hljs load failed:', e); throw e; });
+      }
+      return hljsPromise;
+    },
+  };
+})();
+
+// 32-bit FNV-1a with no dependencies.
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h.toString(36);
+}
+
+function isKatexReady() {
+  return typeof window.katex !== 'undefined';
+}
+
+let katexLoadRequested = false;
+
+function ensureKatexLoaded() {
+  if (!CFG.math || isKatexReady() || katexLoadRequested) return;
+  katexLoadRequested = true;
+  assets.katex().then(() => {
+    schedule();
+  }).catch(() => { /* Already warned by assets.katex(). */ });
+}
+
+// ========== 3. math-rewriter ==========
+
+// Apply narrow TeX fixes only for cases that are known to break rendering.
+//
+// 1. Display mode: normalise matrix and alignment newlines into `\\\n`.
+// 2. `demoteLeftRightAroundBraces`: when a token contains `\underbrace`
+//    or `\overbrace`, strip every `\left` / `\right` modifier from its
+//    delimiters. KaTeX's auto-sizing reads the max depth of enclosed
+//    content to pick a delimiter size, and a brace label inflates that
+//    depth enough to jump straight to `delim-size4` (absurdly large
+//    parens around a short formula). The classic `\smash[b]{}` trick
+//    works in real LaTeX but KaTeX's implementation crops the smashed
+//    depth visually, taking the label with it. Removing `\left\right`
+//    drops us back to the literal delimiter characters at their natural
+//    size — which is exactly what classical TeX typesetting (and the
+//    Google AI Studio reference rendering) does for a labelled-brace
+//    expression. For expressions with genuinely tall content that need
+//    auto-sized delimiters, the label-brace shape is rare enough in
+//    long-form prose that the trade-off is net positive.
+function fixTeX(tex, display) {
+  let fixed = demoteLeftRightAroundBraces(tex);
+  if (display) {
+    fixed = fixed.replace(/([^\\])\\\s*\n/g, '$1\\\\\n');
+  }
+  return fixed;
+}
+
+// Only the common delimiter pairs are handled. `\left.` (invisible) is
+// intentionally left alone because replacing it with a literal `.` would
+// introduce a visible dot; any expression that opens with `\left.` is
+// outside the "labelled brace in prose" scenario this fix targets.
+const LEFT_RIGHT_SUBSTITUTIONS = [
+  [/\\left\(/g, '('],
+  [/\\right\)/g, ')'],
+  [/\\left\[/g, '['],
+  [/\\right\]/g, ']'],
+  [/\\left\\\{/g, '\\{'],
+  [/\\right\\\}/g, '\\}'],
+  [/\\left\|/g, '|'],
+  [/\\right\|/g, '|'],
+  [/\\left\\lvert\b/g, '\\lvert'],
+  [/\\right\\rvert\b/g, '\\rvert'],
+  [/\\left\\langle\b/g, '\\langle'],
+  [/\\right\\rangle\b/g, '\\rangle'],
+];
+
+function demoteLeftRightAroundBraces(tex) {
+  if (typeof tex !== 'string' || tex.length === 0) return tex;
+  if (tex.indexOf('\\underbrace') === -1 && tex.indexOf('\\overbrace') === -1) {
+    return tex;
+  }
+  let fixed = tex;
+  for (const [pattern, replacement] of LEFT_RIGHT_SUBSTITUTIONS) {
+    fixed = fixed.replace(pattern, replacement);
+  }
+  return fixed;
+}
+
+const ENV_TEX_PROBE_RE = /\\begin\{[A-Za-z]+\*?\}/;
+
+function renderTokenToNode(tok) {
+  const node = document.createElement(tok.display ? 'div' : 'span');
+  node.setAttribute('data-tex-source', tok.tex);
+  node.setAttribute('data-tex-display', tok.display ? '1' : '0');
+  // Tex containing a LaTeX environment (matrix/align/cases/...) is marked
+  // so theme.css can pin its font-size to body scale. Without this an
+  // inline env embedded in a heading inherits heading em scaling, which
+  // compounds with KaTeX's own 1.21× factor and balloons the 2D delimiter
+  // layout visually. Detection is content-based so env math picked up via
+  // bare `\begin..\end`, `$..$`, or `$$..$$` all receive the same treatment.
+  if (ENV_TEX_PROBE_RE.test(tok.tex)) {
+    node.setAttribute('data-tex-kind', 'env');
+  }
+  node.className = 'claude-math';
+  try {
+    node.innerHTML = window.katex.renderToString(
+      fixTeX(tok.tex, tok.display),
+      {
+        displayMode: tok.display,
+        throwOnError: false,
+        strict: 'ignore',
+        output: 'html',
+        trust: false,
+      },
+    );
+  } catch (e) {
+    warn('KaTeX render error:', (e && e.message) || e, 'tex:', tok.tex);
+    node.setAttribute('data-render-error', (e && e.message) || 'unknown');
+    node.textContent =
+      (tok.display ? '$$' : '$') + tok.tex + (tok.display ? '$$' : '$');
+  }
+  return node;
+}
+
+function renderMathInSegment(segment) {
+  if (!CFG.math) {
+    return { complete: true, mutated: false };
+  }
+  if (!isKatexReady()) {
+    return { complete: false, mutated: false };
+  }
+  try {
+    return rewriteMathInSegment(segment, renderTokenToNode);
+  } catch (e) {
+    warn('renderMathInSegment failed:', e);
+    return { complete: true, mutated: false };
+  }
+}
+
+// Diff text is source text, not prose. It must not be touched by the math
+// renderer or by the CJK punctuation pass, even when it contains markdown,
+// TeX delimiters, or a live placeholder-looking string.
+const DIFF_MATH_BLOCK_SELECTOR = [
+  '[data-incipit-diff-island]',
+  '[data-incipit-write-diff]',
+  '[data-incipit-write-diff-modal]',
+  '[class*="diffEditorWrapper"]',
+  '[class*="diffEditorContainer"]',
+  '.monaco-diff-editor',
+].join(', ');
+const HOST_DIFF_MODAL_SELECTOR = '[class*="modalContent_"]';
+const HOST_DIFF_MODAL_CONTENT_SELECTOR = '[class*="diffEditorContainer"], .monaco-diff-editor';
+
+function isDiffSurfaceNode(node) {
+  let el = node;
+  if (el && el.nodeType !== 1) el = el.parentElement;
+  if (!el || !el.closest) return false;
+  if (el.closest(DIFF_MATH_BLOCK_SELECTOR)) return true;
+  const modal = el.closest(HOST_DIFF_MODAL_SELECTOR);
+  return !!(modal && modal.querySelector && modal.querySelector(HOST_DIFF_MODAL_CONTENT_SELECTOR));
+}
+
+// ========== 4b. CJK ↔ ASCII punctuation spacing ==========
+//
+// Some Chromium and Electron builds do not apply `text-autospace`
+// consistently. This walker wraps ASCII punctuation that touches CJK text
+// in `<span class="claude-punc">` so CSS can add spacing.
+//
+// The wrapped span still contains the original punctuation character, so
+// `textContent` stays unchanged. Existing `.claude-punc` nodes are skipped.
+const CJK_RANGE_RE = /[\u3400-\u9fff\uf900-\ufaff\u3000-\u303f]/;
+// Limit the set to punctuation that commonly needs spacing next to CJK.
+// Exclude `-`, `_`, quotes, and `/` to avoid noisy false positives.
+const PUNCT_CHARS = new Set([',', '.', ':', ';', '!', '?', '(', ')']);
+const PUNCT_SKIP_TAGS = new Set([
+  'SCRIPT', 'STYLE', 'CODE', 'PRE', 'TEXTAREA', 'INPUT', 'BUTTON',
+  'SVG', 'MATH',
+]);
+
+function shouldSkipPunctSubtree(el) {
+  if (!el || el.nodeType !== 1) return true;
+  if (PUNCT_SKIP_TAGS.has(el.tagName)) return true;
+  // Skip contenteditable subtrees as a second line of defense.
+  if (el.isContentEditable) return true;
+  if (isDiffSurfaceNode(el)) return true;
+  if (el.classList) {
+    if (el.classList.contains('katex')) return true;
+    if (el.classList.contains('claude-math')) return true;
+    if (el.classList.contains('claude-punc')) return true;
+    if (el.classList.contains('claude-user-copy-btn')) return true;
+    if (el.classList.contains('claude-user-copy-btn-row')) return true;
+    if (el.classList.contains('claude-show-more-row')) return true;
+    if (el.classList.contains('claude-show-more-btn')) return true;
+  }
+  if (el.hasAttribute && el.hasAttribute('data-tex-source')) return true;
+  return false;
+}
+
+function findPunctBoundaries(text) {
+  const boundaries = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (!PUNCT_CHARS.has(ch)) continue;
+    const prev = i > 0 ? text[i - 1] : '';
+    const next = i < text.length - 1 ? text[i + 1] : '';
+    // Only touch punctuation that borders at least one CJK character.
+    if (CJK_RANGE_RE.test(prev) || CJK_RANGE_RE.test(next)) {
+      boundaries.push(i);
+    }
+  }
+  return boundaries;
+}
+
+function splitTextNodeForPunct(textNode) {
+  const value = textNode.nodeValue || '';
+  const boundaries = findPunctBoundaries(value);
+  if (boundaries.length === 0) return false;
+
+  const parent = textNode.parentNode;
+  if (!parent) return false;
+
+  // Do not replace the original text node. React may still hold references
+  // to it for later incremental updates. Shrink the original node in place
+  // and insert the new nodes beside it instead.
+  const firstBoundary = boundaries[0];
+  const prefix = value.slice(0, firstBoundary);
+  const anchor = textNode.nextSibling; // May be `null`, which means append.
+
+  // Build all replacement nodes before mutating the DOM.
+  const toInsert = [];
+  for (let i = 0; i < boundaries.length; i += 1) {
+    const idx = boundaries[i];
+    const span = document.createElement('span');
+    span.className = 'claude-punc';
+    span.textContent = value[idx];
+    toInsert.push(span);
+
+    const sliceStart = idx + 1;
+    const sliceEnd = i + 1 < boundaries.length ? boundaries[i + 1] : value.length;
+    if (sliceEnd > sliceStart) {
+      toInsert.push(document.createTextNode(value.slice(sliceStart, sliceEnd)));
+    }
+  }
+
+  // Shorten the original text node only after the replacement nodes exist.
+  textNode.nodeValue = prefix;
+
+  for (const node of toInsert) {
+    parent.insertBefore(node, anchor);
+  }
+  return true;
+}
+
+function padCjkPunctInSegment(segment) {
+  if (!segment || !segment.isConnected) return false;
+  // Recheck contenteditable state even though `closestSegment` already gates it.
+  if (segment.isContentEditable) return false;
+  if (isDiffSurfaceNode(segment)) return false;
+  // Collect candidates first, then mutate. Editing during traversal would
+  // destabilize the walk.
+  const candidates = [];
+  const stack = [segment];
+  while (stack.length) {
+    const node = stack.pop();
+    if (node.nodeType === 3) {
+      const v = node.nodeValue || '';
+      if (v.length >= 2 && CJK_RANGE_RE.test(v)) {
+        candidates.push(node);
+      }
+      continue;
+    }
+    if (node.nodeType !== 1) continue;
+    if (node !== segment && shouldSkipPunctSubtree(node)) continue;
+    for (const child of node.childNodes) stack.push(child);
+  }
+  let mutated = false;
+  for (const textNode of candidates) {
+    if (!textNode.isConnected) continue;
+    if (splitTextNodeForPunct(textNode)) mutated = true;
+  }
+  return mutated;
+}
+
+// ========== 5. segment-processor ==========
+
+const SEG_VERSION_ATTR = 'data-math-rendered';
+const SEG_HASH_ATTR    = 'data-math-hash';
+const SEG_VERSION      = 'v18';
+const SEG_SELECTOR     = 'p, li, td, th, blockquote, h1, h2, h3, h4, h5, h6, dd, dt';
+// Never use structural containers as fallback segments.
+// Doing so would let `linearizeSegment` stitch text across child blocks and
+// produce invalid DOM when a math span is inserted.
+const FALLBACK_BLOCKED_TAGS = new Set([
+  'UL', 'OL', 'DL', 'MENU',
+  'TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'COLGROUP',
+  'PICTURE', 'FIGURE',
+]);
+
+// Fingerprint the segment using plain text plus `data-tex-source` placeholders.
+function segmentHash(segment) {
+  const parts = [];
+  const collect = (node) => {
+    if (node.nodeType === 3) {
+      parts.push(node.nodeValue);
+      return;
+    }
+    if (node.nodeType !== 1) return;
+    // Already-rendered math contributes its source token.
+    if (node.hasAttribute && node.hasAttribute('data-tex-source')) {
+      parts.push('\x01M');
+      parts.push(node.getAttribute('data-tex-display') === '1' ? 'D' : 'I');
+      parts.push(':');
+      parts.push(node.getAttribute('data-tex-source'));
+      parts.push('\x01');
+      return; // Skip the subtree.
+    }
+    // KaTeX's `<span class="katex">` should already be wrapped by
+    // our `data-tex-source` attribute. This fallback only fires for
+    // stray KaTeX output without the wrapper — read its TeX source
+    // annotation for a stable hash key and stop descending.
+    if (node.classList && node.classList.contains('katex')) {
+      const annot = node.querySelector && node.querySelector('annotation[encoding="application/x-tex"]');
+      parts.push('\x01K:' + (annot ? annot.textContent : '') + '\x01');
+      return;
+    }
+    // Ignore UI elements injected by this script.
+    if (node.classList && (
+          node.classList.contains('claude-user-copy-btn') ||
+          node.classList.contains('claude-user-copy-btn-row') ||
+          node.classList.contains('claude-show-more-row') ||
+          node.classList.contains('claude-show-more-btn')
+        )) return;
+    for (const child of node.childNodes) collect(child);
+  };
+  for (const child of segment.childNodes) collect(child);
+  return fnv1a(parts.join(''));
+}
+
+function processSegment(segment) {
+  if (!segment.isConnected) return;
+  // A queued segment may later move into a contenteditable subtree.
+  // Bail out immediately in that case and leave the DOM untouched.
+  if (segment.isContentEditable) return;
+  if (segment.closest && segment.closest('[contenteditable="true"]')) return;
+  if (isDiffSurfaceNode(segment)) return;
+
+  const curHash = segmentHash(segment);
+  if (segment.getAttribute(SEG_VERSION_ATTR) === SEG_VERSION &&
+      segment.getAttribute(SEG_HASH_ATTR) === curHash) {
+    return; // Cache hit. Leave the DOM untouched.
+  }
+
+  const needsMath = CFG.math && (segment.textContent || '').indexOf('CCREMATH') !== -1;
+  if (needsMath && !isKatexReady()) {
+    pendingSegments.add(segment);
+    ensureKatexLoaded();
+    return;
+  }
+
+  if (needsMath) {
+    const renderResult = renderMathInSegment(segment);
+    if (!renderResult.complete) return;
+  }
+
+  // Apply CJK punctuation spacing only after math rendering.
+  // Math nodes are skipped by class, and running punctuation first would
+  // distort token offsets inside math source text.
+  padCjkPunctInSegment(segment);
+
+  segment.setAttribute(SEG_VERSION_ATTR, SEG_VERSION);
+  segment.setAttribute(SEG_HASH_ATTR, segmentHash(segment));
+}
+
+// ========== 6. observer / scheduler ==========
+
+const pendingSegments = new Set();
+// Roots whose subtree may contain new code blocks or user bubbles. We used
+// to re-scan the entire document on every flush, which was fine in short
+// sessions but became a measurable per-frame cost during long streaming
+// chats. Now characterData mutations only feed `pendingSegments` (math),
+// and only childList mutations push their added Elements here for
+// localized hljs / copy-button passes.
+const pendingRoots = new Set();
+let deferredCodeHighlightUntilIdle = false;
+let rafId = null;
+
+function closestSegment(node) {
+  let el = node;
+  if (el && el.nodeType !== 1) el = el.parentElement;
+  if (!el) return null;
+  // Never touch contenteditable subtrees. The chat input contains real
+  // `<p>` nodes that match `SEG_SELECTOR`, and mutating them would
+  // desynchronize the editor model from the DOM.
+  if (el.isContentEditable) return null;
+  if (isDiffSurfaceNode(el)) return null;
+  // First try the strict `SEG_SELECTOR`.
+  let cur = el;
+  while (cur && cur !== document.body) {
+    if (cur.matches && cur.matches(SEG_SELECTOR)) return cur;
+    cur = cur.parentElement;
+  }
+  // Fallback to the direct parent element when a strict segment is missing,
+  // such as display math rendered inside a bare `<div>`.
+  // Reject root containers and structural blocks so math ranges cannot span
+  // across list items, table rows, or similar child blocks.
+  if (el === document.body || el === document.documentElement) return null;
+  if (FALLBACK_BLOCKED_TAGS.has(el.tagName)) return null;
+  return el;
+}
+
+function enqueueNode(node) {
+  if (!node) return;
+  if (node.nodeType === 1) {
+    const cls = (typeof node.className === 'string' ? node.className : '') || '';
+    if (cls.indexOf('katex') !== -1 ||
+        cls.indexOf('hljs') !== -1 ||
+        cls.indexOf('claude-user-copy-btn') !== -1 ||
+        cls.indexOf('claude-show-more') !== -1 ||
+        cls.indexOf('claude-math') !== -1 ||
+        cls.indexOf('claude-punc') !== -1) {
+      return;
+    }
+    // Skip any subtree rooted inside a contenteditable editor.
+    if (node.isContentEditable) return;
+    if (isDiffSurfaceNode(node)) return;
+    const seg = closestSegment(node);
+    if (seg) pendingSegments.add(seg);
+    if (node.querySelectorAll) {
+      for (const s of node.querySelectorAll(SEG_SELECTOR)) {
+        if (s.isContentEditable) continue;
+        if (isDiffSurfaceNode(s)) continue;
+        pendingSegments.add(s);
+      }
+    }
+  } else if (node.nodeType === 3) {
+    const seg = closestSegment(node);
+    if (seg) pendingSegments.add(seg);
+  }
+}
+
+function schedule() {
+  if (rafId !== null) return;
+  rafId = requestAnimationFrame(flush);
+}
+
+function flush() {
+  rafId = null;
+  if (pendingSegments.size) {
+    const segs = Array.from(pendingSegments);
+    pendingSegments.clear();
+    for (const seg of segs) {
+      if (!seg.isConnected) continue;
+      try { processSegment(seg); }
+      catch (e) { warn('processSegment failed:', e); }
+    }
+  }
+  // Localized hljs + copy-button passes — only roots that grew on this tick.
+  // Mounted-but-already-scanned content is left alone (`:not(.hljs)` keeps
+  // hljs idempotent; `addUserCopyButton` and `classifyUserBubble` are too).
+  if (pendingRoots.size) {
+    const roots = Array.from(pendingRoots);
+    pendingRoots.clear();
+    const hljsReady = typeof window.hljs !== 'undefined';
+    for (const root of roots) {
+      if (!root || (root.isConnected === false)) continue;
+      if (hljsReady) {
+        try { enqueueCodeHighlight(root); } catch (e) { warn('highlight queue failed:', e); }
+      }
+      try { scanAndAddCopyButtons(root, { assistantActions: false }); } catch (e) { warn('copy-btn failed:', e); }
+    }
+  }
+  if (deferredCodeHighlightUntilIdle && typeof window.hljs !== 'undefined') {
+    let busy = false;
+    try { busy = conversationIsBusy(); } catch (_) { busy = false; }
+    if (!busy && document.body) {
+      deferredCodeHighlightUntilIdle = false;
+      enqueueCodeHighlight(document.body);
+    }
+  }
+}
+
+function handleMutations(mutations) {
+  let dirty = false;
+  for (const m of mutations) {
+    if (m.type === 'characterData') {
+      const seg = closestSegment(m.target);
+      if (seg) { pendingSegments.add(seg); dirty = true; }
+    } else if (m.type === 'childList') {
+      for (const node of m.addedNodes) {
+        enqueueNode(node);
+        // Element-only — text nodes never match hljs/userBubble selectors.
+        // For streaming markdown, also rescan the nearest markdown root.
+        // Regular assistant code highlighting itself stays deferred while
+        // busy; this root pass still catches newly mounted user/action UI and
+        // lets the idle flush find all unhighlighted blocks in one sweep.
+        const el = node.nodeType === 1 ? node : node.parentElement;
+        if (node.nodeType === 1) pendingRoots.add(node);
+        const markdownRoot = el && el.closest && el.closest(SEL.markdownRoot);
+        if (markdownRoot) pendingRoots.add(markdownRoot);
+      }
+      // Ignore removed nodes because they are already gone.
+      if (m.addedNodes.length) dirty = true;
+    }
+  }
+  if (dirty || pendingSegments.size || pendingRoots.size) {
+    if (dirty) noteTranscriptActionMutation();
+    schedule();
+  }
+}
+
+// Chromium bug workaround: a MutationObserver with `characterData: true`
+// observing `document.body` disables the IME paint optimization for the
+// contenteditable chat input. Every composition buffer update must
+// generate a mutation record, which forces composition text through the
+// regular paint path — but that path leaves the previous composition
+// frame's pixels behind, accumulating as phantom glyphs (especially when
+// narrow Latin punctuation like `,` `.` precedes wide CJK characters).
+//
+// Fix: scope the content observer to the messages container. The chat
+// input lives in `inputContainer` which is a sibling, not a descendant,
+// so the editor subtree is completely excluded from characterData
+// observation and the paint optimization stays on.
+const MESSAGES_ROOT_SELECTOR = '[class*="messagesContainer_"]';
+
+function setupObserver() {
+  let contentObs = null;
+  let attachedRoot = null;
+
+  function attachContent(root) {
+    if (!root || root === attachedRoot) return;
+    if (contentObs) contentObs.disconnect();
+    attachedRoot = root;
+    contentObs = new MutationObserver(handleMutations);
+    contentObs.observe(root, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    for (const s of root.querySelectorAll(SEG_SELECTOR)) {
+      if (s.isContentEditable) continue;
+      if (isDiffSurfaceNode(s)) continue;
+      pendingSegments.add(s);
+    }
+    // Seed the localized hljs / copy-button pass for everything already
+    // mounted under this messages root. Subsequent growth is handled by
+    // `handleMutations` adding individual subtrees to `pendingRoots`.
+    pendingRoots.add(root);
+    noteTranscriptActionMutation();
+    schedule();
+  }
+
+  const initial = document.querySelector(MESSAGES_ROOT_SELECTOR);
+  if (initial) attachContent(initial);
+
+  // Lightweight finder: childList-only on body, so it does NOT affect the
+  // editor's IME paint. Its job is to pick up messagesContainer when React
+  // mounts or remounts it, and hand it off to the content observer.
+  const finder = new MutationObserver(() => {
+    const root = document.querySelector(MESSAGES_ROOT_SELECTOR);
+    if (root && root !== attachedRoot) attachContent(root);
+  });
+  finder.observe(document.body, { childList: true, subtree: true });
+
+  enqueueInitialSegments();
+  schedule();
+}
+
+// Initial scan:
+//   1. enqueue every element matched by `SEG_SELECTOR`
+//   2. walk text nodes containing `$` or `\` and use `closestSegment`
+//      as a fallback
+function enqueueInitialSegments() {
+  for (const s of document.querySelectorAll(SEG_SELECTOR)) {
+    // `querySelectorAll` bypasses `closestSegment`, so filter editor and
+    // diff nodes explicitly here.
+    if (s.isContentEditable) continue;
+    if (isDiffSurfaceNode(s)) continue;
+    pendingSegments.add(s);
+  }
+
+  const walker = document.createTreeWalker(
+    document.body,
+    NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        const v = node.nodeValue;
+        if (!v || v.length < 2) return NodeFilter.FILTER_REJECT;
+        if (isDiffSurfaceNode(node)) return NodeFilter.FILTER_REJECT;
+        // The render path only cares about placeholders, not raw `$` or
+        // backslash text. Skipping pages without the placeholder prefix
+        // keeps the walker from touching unrelated chrome text.
+        if (v.indexOf('CCREMATH') === -1) return NodeFilter.FILTER_REJECT;
+        // Skip text inside scripts, styles, and code blocks.
+        let p = node.parentNode;
+        while (p && p.nodeType === 1) {
+          const tag = p.tagName;
+          if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'CODE' || tag === 'PRE') {
+            return NodeFilter.FILTER_REJECT;
+          }
+          p = p.parentNode;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    }
+  );
+  let tn;
+  while ((tn = walker.nextNode())) {
+    const seg = closestSegment(tn);
+    if (seg) pendingSegments.add(seg);
+  }
+}
+
+// ========== 7. code-highlight ==========
+
+function incipitCodeUnitOffsetForCodePoint(text, offset) {
+  if (offset <= 0) return 0;
+  let units = 0;
+  let points = 0;
+  for (const ch of String(text || '')) {
+    if (points >= offset) break;
+    units += ch.length;
+    points++;
+  }
+  return units;
+}
+
+function wrapIncipitDiffTextNodeRange(node, start, end, kind) {
+  if (!node || !node.parentNode || end <= start) return;
+  const text = node.nodeValue || '';
+  const startOffset = incipitCodeUnitOffsetForCodePoint(text, start);
+  const endOffset = incipitCodeUnitOffsetForCodePoint(text, end);
+  if (endOffset <= startOffset) return;
+
+  let target = node;
+  if (endOffset < text.length) target.splitText(endOffset);
+  if (startOffset > 0) target = target.splitText(startOffset);
+  if (!target.nodeValue) return;
+
+  const span = document.createElement('span');
+  span.setAttribute('data-incipit-diff-island-char', kind);
+  span.setAttribute('data-incipit-write-diff-char', kind);
+  target.parentNode.insertBefore(span, target);
+  span.appendChild(target);
+}
+
+function applyIncipitDiffCharRangesToCode(code) {
+  const ranges = Array.isArray(code && code.__incipitDiffCharRanges)
+    ? code.__incipitDiffCharRanges
+    : [];
+  const kind = code && code.__incipitDiffCharKind;
+  if (!code || code.dataset.incipitDiffCharsApplied === '1' || !ranges.length ||
+      (kind !== 'add' && kind !== 'del')) {
+    return;
+  }
+
+  const walker = document.createTreeWalker(code, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      return node.parentElement && node.parentElement.closest('[data-incipit-diff-island-char]')
+        ? NodeFilter.FILTER_REJECT
+        : NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const nodes = [];
+  let pos = 0;
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    const length = Array.from(node.nodeValue || '').length;
+    if (length > 0) {
+      nodes.push({ node, start: pos, end: pos + length });
+      pos += length;
+    }
+  }
+
+  for (let r = ranges.length - 1; r >= 0; r--) {
+    const range = ranges[r];
+    if (!range || range.length < 2) continue;
+    const start = range[0];
+    const end = range[1];
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const item = nodes[i];
+      const a = Math.max(start, item.start);
+      const b = Math.min(end, item.end);
+      if (b <= a) continue;
+      wrapIncipitDiffTextNodeRange(item.node, a - item.start, b - item.start, kind);
+    }
+  }
+  code.dataset.incipitDiffCharsApplied = '1';
+}
+
+function isIncipitDiffCodeBlock(block) {
+  return !!(
+    block &&
+    block.matches &&
+    block.matches('[data-incipit-diff-island-code], [data-incipit-write-diff-code]')
+  );
+}
+
+function shouldDeferRegularCodeHighlight(block, busy) {
+  if (!busy) return false;
+  if (!block || !block.closest) return false;
+  // Normal assistant markdown is React-owned while the reply streams. Running
+  // hljs mutates `<code>` into token spans; React then keeps reconciling the
+  // same tail and can replace that subtree, producing a visible layout/color
+  // fight around the code block and everything below it. Defer every regular
+  // markdown code block until SessionState.busy flips false. Diff islands and
+  // tool bodies are owned by separate paths and remain eligible immediately.
+  if (block.closest(`${SEL.toolUse}, ${SEL.toolBody}, [class*="toolBody"], [class*="toolResult"]`)) {
+    return false;
+  }
+  if (!block.closest(SEL.markdownRoot)) return false;
+  return true;
+}
+
+function highlightOneCodeBlock(block, options = {}) {
+  const isDiffIsland = isIncipitDiffCodeBlock(block);
+  if (!isDiffIsland && shouldDeferRegularCodeHighlight(block, options.busy === true)) {
+    deferredCodeHighlightUntilIdle = true;
+    // Deliberately avoid even a diagnostic data-attr here. During streaming
+    // this `<code>` node is React-owned; any mutation by us can be reverted by
+    // the next host commit and contribute to the visible code-block twitch.
+    return;
+  }
+
+  if (isDiffIsland) {
+    if (block.dataset) delete block.dataset.incipitDiffCharsApplied;
+    // If char spans were applied before highlight.js loaded, strip that
+    // markup back to plain text before hljs tokenizes. The original text is
+    // still exactly `textContent`; the row metadata lives on expando props.
+    if (block.querySelector && block.querySelector('[data-incipit-diff-island-char]')) {
+      block.textContent = block.textContent || '';
+    }
+  } else if (block.dataset && block.dataset.incipitHljsDeferred) {
+    delete block.dataset.incipitHljsDeferred;
+  }
+  try { window.hljs.highlightElement(block); } catch (e) { /* ignore */ }
+  if (isDiffIsland) applyIncipitDiffCharRangesToCode(block);
+}
+
+export function highlightAllCode(root) {
+  if (typeof window.hljs === 'undefined') return;
+  const scope = root || document.body;
+  if (!scope) return;
+  // During streaming the host keeps rebuilding the markdown tail. Running
+  // hljs on regular assistant code blocks makes incipit and React fight over
+  // the same `<code>` node, causing visible color/layout jitter. Queue them
+  // and let the busy-state hook flush once the stream is actually idle.
+  let busy = false;
+  try { busy = conversationIsBusy(); } catch (_) { busy = false; }
+  // Match the root itself too — `querySelectorAll` excludes the host node,
+  // so a mutation that lands a `<pre><code>` directly would otherwise miss.
+  if (scope.matches && scope.matches('pre code:not(.hljs)') &&
+      !scope.classList.contains('language-latex')) {
+    highlightOneCodeBlock(scope, { busy });
+  }
+  if (!scope.querySelectorAll) return;
+  const blocks = scope.querySelectorAll('pre code:not(.hljs)');
+  for (const block of blocks) {
+    if (block.classList.contains('language-latex')) continue;
+    highlightOneCodeBlock(block, { busy });
+  }
+}
+
+const HIGHLIGHT_CHUNK_BUDGET_MS = 8;
+const HIGHLIGHT_CHUNK_MIN_BLOCKS = 8;
+const pendingCodeHighlights = [];
+const pendingCodeHighlightSet = new Set();
+let codeHighlightRaf = 0;
+
+export function enqueueCodeHighlight(root) {
+  if (typeof window.hljs === 'undefined') return;
+  const scope = root || document.body;
+  if (!scope) return;
+  const add = block => {
+    if (!block || pendingCodeHighlightSet.has(block)) return;
+    if (block.classList && (
+          block.classList.contains('hljs') ||
+          block.classList.contains('language-latex')
+        )) return;
+    pendingCodeHighlightSet.add(block);
+    pendingCodeHighlights.push(block);
+  };
+  if (scope.matches && scope.matches('pre code:not(.hljs)')) add(scope);
+  if (scope.querySelectorAll) {
+    scope.querySelectorAll('pre code:not(.hljs)').forEach(add);
+  }
+  scheduleCodeHighlightChunk();
+}
+
+function scheduleCodeHighlightChunk() {
+  if (codeHighlightRaf || !pendingCodeHighlights.length) return;
+  codeHighlightRaf = requestAnimationFrame(runCodeHighlightChunk);
+}
+
+function runCodeHighlightChunk() {
+  codeHighlightRaf = 0;
+  if (typeof window.hljs === 'undefined') {
+    pendingCodeHighlightSet.clear();
+    pendingCodeHighlights.length = 0;
+    return;
+  }
+  let busy = false;
+  try { busy = conversationIsBusy(); } catch (_) { busy = false; }
+  const start = (typeof performance !== 'undefined' && performance.now)
+    ? performance.now()
+    : Date.now();
+  let processed = 0;
+  while (pendingCodeHighlights.length) {
+    const block = pendingCodeHighlights.shift();
+    pendingCodeHighlightSet.delete(block);
+    if (block && block.isConnected && !block.classList.contains('hljs') &&
+        !block.classList.contains('language-latex')) {
+      try { highlightOneCodeBlock(block, { busy }); }
+      catch (e) { warn('highlight failed:', e); }
+    }
+    processed++;
+    const elapsed = ((typeof performance !== 'undefined' && performance.now)
+      ? performance.now()
+      : Date.now()) - start;
+    if (processed >= HIGHLIGHT_CHUNK_MIN_BLOCKS && elapsed >= HIGHLIGHT_CHUNK_BUDGET_MS) {
+      break;
+    }
+  }
+  if (pendingCodeHighlights.length) scheduleCodeHighlightChunk();
+}
+
+export function flushDeferredCodeHighlights() {
+  if (!deferredCodeHighlightUntilIdle || typeof window.hljs === 'undefined' || !document.body) {
+    return false;
+  }
+  if (conversationIsBusy()) return false;
+  deferredCodeHighlightUntilIdle = false;
+  enqueueCodeHighlight(document.body);
+  return true;
+}
+
+export function hasDeferredCodeHighlights() {
+  return deferredCodeHighlightUntilIdle === true;
+}
+
+export function scanCopyButtons(root, options = {}) {
+  scanAndAddCopyButtons(root || document.body, options);
+}
+
+let typographyStarted = false;
+
+export function initTypography(hooks = {}) {
+  configureTypographyHooks(hooks);
+  exposeTypographyApi();
+  if (typographyStarted) return globalThis.__incipitTypography;
+  typographyStarted = true;
+  setupObserver();
+
+  assets.hljs().then(() => {
+    // Once hljs lands, sweep what's already on the page. Mutations after
+    // this point feed pendingRoots per-subtree. The sweep is chunked so a
+    // long transcript cannot monopolize the boot frame.
+    if (document.body) pendingRoots.add(document.body);
+    schedule();
+  }).catch(() => { /* Already warned. */ });
+
+  return globalThis.__incipitTypography;
+}
+
+function exposeTypographyApi() {
+  globalThis.__incipitTypography = {
+    configure: configureTypographyHooks,
+    init: initTypography,
+    enqueueCodeHighlight,
+    flushDeferredCodeHighlights,
+    hasDeferredCodeHighlights,
+    highlightAllCode,
+    scanCopyButtons,
+  };
+}
+
+exposeTypographyApi();

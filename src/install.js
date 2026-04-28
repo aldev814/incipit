@@ -19,7 +19,13 @@ const { HOST_BADGE_COMM_ATTACH } = require('./badge-iife');
 // constants
 // ============================================================
 
-const { getFeatures, getTheme, BODY_FONT_SIZE_OPTIONS } = require('./config');
+const {
+  getFeatures,
+  getTheme,
+  getLanguage,
+  pruneRetiredConfigKeys,
+  BODY_FONT_SIZE_OPTIONS,
+} = require('./config');
 
 const CLAUDE_CODE_EXTENSION_PREFIX = 'anthropic.claude-code-';
 const ENHANCE_TARGET_NAME = 'enhance.js';
@@ -30,11 +36,20 @@ const THEME_TARGET_NAME = 'theme.css';
 // backticks cannot terminate the template by accident.
 const ROOT_WEBVIEW_FILES = [
   [path.join('data', 'claude_code_enhance.js'), ENHANCE_TARGET_NAME],
+  [path.join('data', 'enhance_shared.js'),      'enhance_shared.js'],
+  [path.join('data', 'enhance_footer_badge.js'), 'enhance_footer_badge.js'],
+  [path.join('data', 'enhance_thinking.js'),    'enhance_thinking.js'],
+  [path.join('data', 'enhance_typography.js'),  'enhance_typography.js'],
+  [path.join('data', 'enhance_legacy.js'),      'enhance_legacy.js'],
   [path.join('data', 'host_probe.js'),           'host_probe.js'],
   [path.join('data', 'host-badge.cjs'),          'host-badge.cjs'],
   [path.join('data', 'math_tokens.js'),         'math_tokens.js'],
   [path.join('data', 'math_rewriter.js'),       'math_rewriter.js'],
   [path.join('data', 'theme.css'),              THEME_TARGET_NAME],
+  // Warm-white palette overrides. Always copied so users can flip the
+  // setting without re-running apply just to ship the CSS file. enhance.js
+  // only loads this stylesheet when `theme.palette === 'warm-white'`.
+  [path.join('data', 'warm-white-override.css'), 'warm-white-override.css'],
 ];
 
 const CDN_HOST = 'https://cdnjs.cloudflare.com';
@@ -42,7 +57,7 @@ const IMPORT_MARKER =
   'import("./enhance.js").catch(e=>console.error("[incipit] enhance.js import failed",e));';
 // Local asset subtrees copied from `data/<name>/` to `webview/<name>/`.
 // Sync the whole subtree so math, highlighting, and fonts work offline.
-const LOCAL_ASSET_TREES = ['katex', 'hljs', 'fonts'];
+const LOCAL_ASSET_TREES = ['katex', 'hljs', 'fonts', 'effort-brain'];
 // Asset subtrees we used to ship but no longer need. `apply` wipes these on
 // sight so upgrades never leave dead bytes behind in the host webview folder.
 const LEGACY_ASSET_TREES = ['mathjax'];
@@ -123,6 +138,205 @@ const BADGE_COMM_ATTACH_PATTERN = /this\.webview=[A-Za-z_$][\w$]*;/g;
 const BADGE_COMM_ATTACH_PATCHED_RE =
   /this\.webview=[A-Za-z_$][\w$]*;require\("\.\/webview\/host-badge\.cjs"\)\.attachComm\(this\);/;
 
+// Give the host's Monaco diff editor an incipit-owned theme, font, and gutter.
+// Claude Code 2.1.x hard-codes both inline and expanded Edit diff editors to
+// `theme:"vs-dark"` and `fontSize:12`, which makes warm-white render a dark
+// Monaco island using the default editor font, and `lineNumbers:"off"`, which
+// leaves inline diff rows with `--` placeholders instead of a useful gutter.
+// We patch those options to use a bundled GitHub-like Monaco theme, Rec Mono
+// Linear, Monaco's native line-number geometry, and a zero-width
+// `lineDecorationsWidth` lane. That last option removes the 10px +/- glyph
+// column Monaco keeps between the line numbers and code; with incipit's own
+// diff gutter overlay, leaving the lane in place creates an uncolored seam in
+// changed rows. The theme helper is installed in the generated webview preamble
+// and falls back to Monaco's built-in `vs` / `vs-dark` themes if the private
+// bundle shape changes.
+const WEBVIEW_CONFIG_RE =
+  /^\/\/ incipit webview config \(generated at apply; do not edit\)\r?\n[\s\S]*?\r?\n\r?\n/;
+const MONACO_DIFF_LIGHT_THEME = 'incipit-github-light';
+const MONACO_DIFF_DARK_THEME = 'incipit-github-dark';
+const MONACO_DIFF_THEME_FALLBACK_EXPR =
+  '(globalThis.__incipitConfig&&globalThis.__incipitConfig.theme&&globalThis.__incipitConfig.theme.palette==="warm-white"?"vs":"vs-dark")';
+const MONACO_DIFF_THEME_EXPR =
+  `(globalThis.__incipitPickMonacoDiffTheme?globalThis.__incipitPickMonacoDiffTheme(m$):${MONACO_DIFF_THEME_FALLBACK_EXPR})`;
+const MONACO_DIFF_THEME_HARDCODED_RE = /theme:"vs-dark"/g;
+const MONACO_DIFF_THEME_LEGACY_PATCHED_RE =
+  /theme:\(globalThis\.__incipitConfig&&globalThis\.__incipitConfig\.theme&&globalThis\.__incipitConfig\.theme\.palette==="warm-white"\?"vs":"vs-dark"\)/g;
+const MONACO_DIFF_THEME_PATCHED_RE =
+  /theme:\(globalThis\.__incipitPickMonacoDiffTheme\?globalThis\.__incipitPickMonacoDiffTheme\(m\$\):\(globalThis\.__incipitConfig&&globalThis\.__incipitConfig\.theme&&globalThis\.__incipitConfig\.theme\.palette==="warm-white"\?"vs":"vs-dark"\)\)/g;
+const MONACO_DIFF_FONT_OPTIONS =
+  'fontSize:12,fontFamily:"\'Rec Mono Linear\', Consolas, Monaco, \'Courier New\', monospace",fontLigatures:false,fontVariations:"\\"MONO\\" 1, \\"CASL\\" 0, \\"slnt\\" 0"';
+const MONACO_DIFF_FONT_LAYOUT_OPTIONS =
+  `${MONACO_DIFF_FONT_OPTIONS},lineNumbers:"on",lineDecorationsWidth:0`;
+const MONACO_DIFF_FONT_HARDCODED_RE = /fontSize:12,lineNumbers:"off"/g;
+const MONACO_DIFF_FONT_LEGACY_PATCHED_RE =
+  /fontSize:12,fontFamily:"'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace",fontLigatures:false,fontVariations:"\\"MONO\\" 1, \\"CASL\\" 0, \\"slnt\\" 0",lineNumbers:"off"/g;
+const MONACO_DIFF_FONT_OLD_PATCHED_RE =
+  /fontSize:12,fontFamily:"'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace",fontLigatures:false,fontVariations:"\\"MONO\\" 1, \\"CASL\\" 0, \\"slnt\\" 0",lineNumbers:"on"(?!,lineDecorationsWidth:0)/g;
+const MONACO_DIFF_FONT_PATCHED_RE =
+  /fontSize:12,fontFamily:"'Rec Mono Linear', Consolas, Monaco, 'Courier New', monospace",fontLigatures:false,fontVariations:"\\"MONO\\" 1, \\"CASL\\" 0, \\"slnt\\" 0",lineNumbers:"on",lineDecorationsWidth:0/g;
+const MONACO_DIFF_WORD_WRAP_HARDCODED_RE = /wordWrap:"on",wrappingIndent:"same"/g;
+const MONACO_DIFF_WORD_WRAP_PATCHED_RE = /wordWrap:"off",wrappingIndent:"same"/g;
+const MONACO_DIFF_OVERVIEW_HARDCODED_RE =
+  /readOnly:!0,renderSideBySide:!0,renderOverviewRuler:!0/g;
+const MONACO_DIFF_OVERVIEW_PATCHED_RE =
+  /readOnly:!0,renderSideBySide:!0,renderOverviewRuler:!1/g;
+const MONACO_DIFF_OVERVIEW_INLINE_LAYOUT_PATCHED_RE =
+  /readOnly:!0,renderSideBySide:!1,renderOverviewRuler:!1/g;
+const MONACO_DIFF_INLINE_LAYOUT_HARDCODED_RE =
+  /([\w$]+\.createDiffEditor\([^,]+,\{readOnly:!0,)renderSideBySide:!0(,renderOverviewRuler:!1,[\s\S]{0,1800}?lightbulb:\{enabled:[\w$]+\.ShowLightbulbIconMode\.Off\})/g;
+const MONACO_DIFF_INLINE_LAYOUT_PATCHED_RE =
+  /[\w$]+\.createDiffEditor\([^,]+,\{readOnly:!0,renderSideBySide:!1,renderOverviewRuler:!1,[\s\S]{0,1800}?lightbulb:\{enabled:[\w$]+\.ShowLightbulbIconMode\.Off\}/g;
+const MONACO_DIFF_INLINE_RESIZE_HARDCODED_RE =
+  /([\w$]+)\(!([\w$]+)\),([\w$]+)\.updateOptions\(\{renderSideBySide:\2\}\)/g;
+const MONACO_DIFF_INLINE_RESIZE_PATCHED_RE =
+  /[\w$]+\(!0\),[\w$]+\.updateOptions\(\{renderSideBySide:!1\}\)/g;
+const MONACO_DIFF_MODAL_LAYOUT_HARDCODED_RE =
+  /([\w$]+\.createDiffEditor\([^,]+,\{readOnly:!0,)renderSideBySide:!0(,renderOverviewRuler:!1,[\s\S]{0,1800}?scrollbar:\{vertical:"auto",horizontal:"(?:auto|hidden)"\})/g;
+const MONACO_DIFF_MODAL_LAYOUT_PATCHED_RE =
+  /[\w$]+\.createDiffEditor\([^,]+,\{readOnly:!0,renderSideBySide:!1,renderOverviewRuler:!1,[\s\S]{0,1800}?scrollbar:\{vertical:"auto",horizontal:"(?:auto|hidden)"\}/g;
+const MONACO_DIFF_MODAL_SCROLLBAR_HARDCODED_RE =
+  /scrollbar:\{vertical:"auto",horizontal:"auto"\}/g;
+const MONACO_DIFF_MODAL_SCROLLBAR_LEGACY_HIDDEN_RE =
+  /scrollbar:\{vertical:"auto",horizontal:"hidden"\}/g;
+const MONACO_DIFF_THEMES = Object.freeze({
+  [MONACO_DIFF_LIGHT_THEME]: {
+    base: 'vs',
+    inherit: true,
+    rules: [
+      // Syntax foregrounds mirror highlight.js `vs.min.css`; diff line and
+      // char backgrounds below intentionally stay GitHub-like. Do not use
+      // pure #ff0000 for attributes here: it collapses on removed-char red.
+      { token: '', foreground: '000000' },
+      // Monaco's built-in `vs` theme styles Markdown `strong` as bold and
+      // `emphasis` as italic. Diff editors show source text, not rendered
+      // Markdown, so reset typographic token styles to regular weight/slant.
+      { token: 'strong', fontStyle: '' },
+      { token: 'emphasis', fontStyle: '' },
+      { token: 'bold', fontStyle: '' },
+      { token: 'italic', fontStyle: '' },
+      { token: 'markup.bold', fontStyle: '' },
+      { token: 'markup.italic', fontStyle: '' },
+      { token: 'markup.heading', fontStyle: '' },
+      { token: 'heading', fontStyle: '' },
+      { token: 'comment', foreground: '008000' },
+      { token: 'quote', foreground: '008000' },
+      { token: 'variable', foreground: '008000' },
+      { token: 'variable.predefined', foreground: '008000' },
+      { token: 'keyword', foreground: '0000ff' },
+      { token: 'operator', foreground: '0000ff' },
+      { token: 'name', foreground: '0000ff' },
+      { token: 'tag', foreground: '0000ff' },
+      { token: 'selector', foreground: '0000ff' },
+      { token: 'constant', foreground: 'a31515' },
+      { token: 'literal', foreground: 'a31515' },
+      { token: 'number', foreground: 'a31515' },
+      { token: 'string', foreground: 'a31515' },
+      { token: 'type', foreground: 'a31515' },
+      { token: 'class', foreground: 'a31515' },
+      { token: 'interface', foreground: 'a31515' },
+      { token: 'namespace', foreground: 'a31515' },
+      { token: 'function', foreground: 'a31515' },
+      { token: 'attribute.name', foreground: 'a31515' },
+      { token: 'attribute.value', foreground: 'a31515' },
+      { token: 'regexp', foreground: 'a31515' },
+      { token: 'meta', foreground: '2b91af' },
+      { token: 'delimiter', foreground: '000000' },
+    ],
+    colors: {
+      'editor.background': '#fafaf5',
+      'editor.foreground': '#1f2328',
+      'editorGutter.background': '#fafaf5',
+      'editorLineNumber.foreground': '#6e7781',
+      'editorLineNumber.activeForeground': '#24292f',
+      'editor.lineHighlightBackground': '#00000000',
+      'editor.lineHighlightBorder': '#00000000',
+      'editor.selectionBackground': '#0969da30',
+      'editor.inactiveSelectionBackground': '#0969da20',
+      'editorIndentGuide.background1': '#00000000',
+      'editorIndentGuide.activeBackground1': '#00000000',
+      'editorWhitespace.foreground': '#6e778155',
+      'diffEditor.insertedLineBackground': '#dafbe180',
+      'diffEditor.removedLineBackground': '#ffebe980',
+      'diffEditor.insertedTextBackground': '#aceebb99',
+      'diffEditor.removedTextBackground': '#ff818266',
+      'diffEditor.border': '#d0d7de',
+      'diffEditor.diagonalFill': '#d0d7de33',
+      'scrollbarSlider.background': '#b0b0ae80',
+      'scrollbarSlider.hoverBackground': '#8a8a8880',
+      'scrollbarSlider.activeBackground': '#6f6f6d99',
+    },
+  },
+  [MONACO_DIFF_DARK_THEME]: {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      // Syntax foregrounds mirror highlight.js `vs2015.min.css`; diff line
+      // and char backgrounds below intentionally stay GitHub-like.
+      { token: '', foreground: 'dcdcdc' },
+      // Monaco's built-in `vs-dark` theme styles Markdown `strong` as bold
+      // and `emphasis` as italic. Diff editors show source text, not rendered
+      // Markdown, so reset typographic token styles to regular weight/slant.
+      { token: 'strong', fontStyle: '' },
+      { token: 'emphasis', fontStyle: '' },
+      { token: 'bold', fontStyle: '' },
+      { token: 'italic', fontStyle: '' },
+      { token: 'markup.bold', fontStyle: '' },
+      { token: 'markup.italic', fontStyle: '' },
+      { token: 'markup.heading', fontStyle: '' },
+      { token: 'heading', fontStyle: '' },
+      { token: 'comment', foreground: '57a64a' },
+      { token: 'quote', foreground: '57a64a' },
+      { token: 'doctag', foreground: '608b4e' },
+      { token: 'keyword', foreground: '569cd6' },
+      { token: 'operator', foreground: '569cd6' },
+      { token: 'literal', foreground: '569cd6' },
+      { token: 'name', foreground: '569cd6' },
+      { token: 'symbol', foreground: '569cd6' },
+      { token: 'link', foreground: '569cd6' },
+      { token: 'type', foreground: '4ec9b0' },
+      { token: 'type.identifier', foreground: '4ec9b0' },
+      { token: 'number', foreground: 'b8d7a3' },
+      { token: 'class', foreground: 'b8d7a3' },
+      { token: 'interface', foreground: 'b8d7a3' },
+      { token: 'namespace', foreground: 'b8d7a3' },
+      { token: 'string', foreground: 'd69d85' },
+      { token: 'regexp', foreground: '9a5334' },
+      { token: 'tag', foreground: '9b9b9b' },
+      { token: 'meta', foreground: '9b9b9b' },
+      { token: 'attribute.name', foreground: '9cdcfe' },
+      { token: 'attribute.value', foreground: 'd69d85' },
+      { token: 'variable', foreground: 'bd63c5' },
+      { token: 'variable.predefined', foreground: 'bd63c5' },
+      { token: 'function', foreground: 'dcdcdc' },
+      { token: 'delimiter', foreground: 'dcdcdc' },
+    ],
+    colors: {
+      'editor.background': '#1f1f1e',
+      'editor.foreground': '#e6edf3',
+      'editorGutter.background': '#1f1f1e',
+      'editorLineNumber.foreground': '#8b949e',
+      'editorLineNumber.activeForeground': '#e6edf3',
+      'editor.lineHighlightBackground': '#ffffff08',
+      'editor.lineHighlightBorder': '#00000000',
+      'editor.selectionBackground': '#2f81f766',
+      'editor.inactiveSelectionBackground': '#2f81f733',
+      'editorIndentGuide.background1': '#00000000',
+      'editorIndentGuide.activeBackground1': '#00000000',
+      'editorWhitespace.foreground': '#8b949e55',
+      'diffEditor.insertedLineBackground': '#23863633',
+      'diffEditor.removedLineBackground': '#da363333',
+      'diffEditor.insertedTextBackground': '#2ea04366',
+      'diffEditor.removedTextBackground': '#f8514966',
+      'diffEditor.border': '#30363d',
+      'diffEditor.diagonalFill': '#30363d66',
+      'scrollbarSlider.background': '#3c3c3c80',
+      'scrollbarSlider.hoverBackground': '#5a5a5a80',
+      'scrollbarSlider.activeBackground': '#6a6a6a99',
+    },
+  },
+});
+
 // Remove the legacy module-load diagnostic probe.
 const LEGACY_MODLOAD_RE =
   /try\{require\('fs'\)\.appendFileSync\([^)]*MODULE LOADED[^)]*\)\}catch\(e\)\{\};/g;
@@ -135,6 +349,11 @@ function extensionRoot(home) {
   return path.join(home || os.homedir(), '.vscode', 'extensions');
 }
 
+// Default location of the host's user settings.json — used only as a
+// fallback when no explicit `settingsPath` is threaded through. With the
+// new multi-target system the explicit path is the norm; this default
+// remains as a backstop for early callers and for the legacy
+// "single host, default VS Code" detection path.
 function vscodeUserSettingsPath() {
   const home = os.homedir();
   if (process.platform === 'win32') {
@@ -181,7 +400,7 @@ function compareVersionTuples(a, b) {
   return 0;
 }
 
-function buildTarget(extensionDir) {
+function buildTarget(extensionDir, settingsPath) {
   const extensionJsPath = path.join(extensionDir, 'extension.js');
   const webviewIndexJsPath = path.join(extensionDir, 'webview', 'index.js');
   if (!fs.existsSync(extensionJsPath)) {
@@ -196,14 +415,36 @@ function buildTarget(extensionDir) {
     extensionJsPath,
     webviewIndexJsPath,
     enhanceJsPath: path.join(extensionDir, 'webview', ENHANCE_TARGET_NAME),
+    settingsPath: settingsPath || vscodeUserSettingsPath(),
     version: v.length ? v.join('.') : 'unknown',
   };
 }
 
-function findLatestClaudeCodeExtension(home) {
-  const root = extensionRoot(home);
+// Locate the latest Claude Code extension under a given extensions root.
+//
+// Accepts:
+//   - a string (legacy positional `home` arg): treated as the user's HOME
+//     directory; extensions are looked up under `<home>/.vscode/extensions`.
+//   - an object `{ extensionsDir, settingsPath, home }`: explicit
+//     extensions directory takes priority; `home` is the legacy fallback.
+//
+// The returned target carries `settingsPath` from the supplied options
+// (or the platform-default `vscodeUserSettingsPath()` if absent), which
+// is then threaded into apply / backup / restore.
+function findLatestClaudeCodeExtension(arg) {
+  let extensionsDir = null;
+  let settingsPath = null;
+  let home = null;
+  if (typeof arg === 'string') {
+    home = arg;
+  } else if (arg && typeof arg === 'object') {
+    extensionsDir = arg.extensionsDir || null;
+    settingsPath = arg.settingsPath || null;
+    home = arg.home || null;
+  }
+  const root = extensionsDir || extensionRoot(home);
   if (!fs.existsSync(root)) {
-    throw new Error(`未找到 VS Code 扩展目录:${root}`);
+    throw new Error(`未找到扩展目录:${root}`);
   }
   const names = fs.readdirSync(root)
     .filter(n => n.startsWith(CLAUDE_CODE_EXTENSION_PREFIX));
@@ -215,7 +456,7 @@ function findLatestClaudeCodeExtension(home) {
     } catch (_) {}
   }
   if (!candidates.length) {
-    throw new Error('未检测到 Claude Code for VS Code 扩展。');
+    throw new Error('未检测到 Claude Code 扩展。');
   }
   candidates.sort((a, b) => {
     const cmp = compareVersionTuples(
@@ -225,7 +466,7 @@ function findLatestClaudeCodeExtension(home) {
     if (cmp !== 0) return cmp;
     return fs.statSync(a).mtimeMs - fs.statSync(b).mtimeMs;
   });
-  return buildTarget(candidates[candidates.length - 1]);
+  return buildTarget(candidates[candidates.length - 1], settingsPath);
 }
 
 // ============================================================
@@ -303,10 +544,43 @@ function copyWithTransform(srcPath, dstPath, transform) {
   return true;
 }
 
-function buildEnhancePreamble(features) {
-  const json = JSON.stringify({ features });
+function normalizeConfigLanguage(language) {
+  return language === 'zh' ? 'zh' : 'en';
+}
+
+function buildIncipitConfigJSON(features, theme, language) {
+  return JSON.stringify({
+    features,
+    theme: theme || {},
+    language: normalizeConfigLanguage(language),
+  });
+}
+
+function buildEnhancePreamble(features, theme, language) {
+  // `theme` may be undefined for legacy callers that haven't been updated;
+  // enhance.js reads `palette` defensively so missing fields fall back to
+  // the dark default. Bundling theme into the same frozen config object
+  // keeps a single read site in the webview.
+  const json = buildIncipitConfigJSON(features, theme, language);
   return '// incipit user config (generated at apply; do not edit)\n' +
          `globalThis.__incipitConfig = Object.freeze(${json});\n\n`;
+}
+
+function buildWebviewConfigPreamble(features, theme, language) {
+  // Unlike enhance.js, the host bundle can create Monaco diff editors before
+  // our dynamic import has finished. Put the same config at the top of
+  // webview/index.js so the patched `createDiffEditor({ theme: ... })` sees
+  // the palette synchronously during first render. The Monaco theme helper is
+  // also defined here because the `m$` Monaco editor namespace is local to the
+  // host bundle; the patched `theme:` option passes it in lazily.
+  const json = buildIncipitConfigJSON(features, theme, language);
+  const diffThemes = JSON.stringify(MONACO_DIFF_THEMES);
+  return '// incipit webview config (generated at apply; do not edit)\n' +
+         `globalThis.__incipitConfig = Object.freeze(${json});\n` +
+         `globalThis.__incipitMonacoDiffThemes = Object.freeze(${diffThemes});\n` +
+         '(function(){try{var raw=globalThis.acquireVsCodeApi;if(typeof raw==="function"&&!globalThis.__incipitGetVsCodeApi){var cached=null;globalThis.__incipitGetVsCodeApi=function(){if(cached)return cached;cached=raw();return cached;};globalThis.acquireVsCodeApi=function(){return globalThis.__incipitGetVsCodeApi();};}}catch(_){}})();\n' +
+         'globalThis.__incipitEnsureMonacoDiffTheme = function(monaco){try{if(!monaco||typeof monaco.defineTheme!=="function")return false;if(globalThis.__incipitMonacoDiffThemesReady)return true;var themes=globalThis.__incipitMonacoDiffThemes||{};for(var name in themes)if(Object.prototype.hasOwnProperty.call(themes,name))monaco.defineTheme(name,themes[name]);globalThis.__incipitMonacoDiffThemesReady=true;if(!globalThis.__incipitMonacoDiffFontsReady&&typeof document!=="undefined"&&document.fonts&&document.fonts.ready){globalThis.__incipitMonacoDiffFontsReady=true;document.fonts.ready.then(function(){try{if(monaco&&typeof monaco.remeasureFonts==="function")monaco.remeasureFonts();}catch(_){}});}return true;}catch(e){try{console.warn("[incipit] Monaco diff theme setup failed",e);}catch(_){}return false;}};\n' +
+         `globalThis.__incipitPickMonacoDiffTheme = function(monaco){var light=globalThis.__incipitConfig&&globalThis.__incipitConfig.theme&&globalThis.__incipitConfig.theme.palette==="warm-white";var ok=globalThis.__incipitEnsureMonacoDiffTheme&&globalThis.__incipitEnsureMonacoDiffTheme(monaco);return ok?(light?"${MONACO_DIFF_LIGHT_THEME}":"${MONACO_DIFF_DARK_THEME}"):(light?"vs":"vs-dark");};\n\n`;
 }
 
 function buildThemeOverrideBlock(theme) {
@@ -469,10 +743,16 @@ function installSerifSystemFonts(resourceRoot) {
 
 // Return whether either setting changed. `fontSize` must be one of the
 // discrete body-size options; the caller is expected to pass `getTheme()
-// .bodyFontSize` but a stray value falls back to the default.
-function setChatFontToSerif(fontSize) {
+// .bodyFontSize` but a stray value falls back to the default. Explicit
+// `settingsPath` overrides the platform-default fallback — that is how
+// custom (Cursor / Scoop / portable) targets get their settings.json.
+function setChatFontToSerif(fontSize, settingsPath) {
   const size = BODY_FONT_SIZE_OPTIONS.includes(fontSize) ? fontSize : CHAT_FONT_SIZE;
-  const settingsPath = vscodeUserSettingsPath();
+  const path_ = settingsPath || vscodeUserSettingsPath();
+  return writeChatFontSettings(path_, size);
+}
+
+function writeChatFontSettings(settingsPath, size) {
   const parent = path.dirname(settingsPath);
   if (!fs.existsSync(parent)) {
     // Skip when the VS Code user settings directory does not exist yet.
@@ -602,6 +882,90 @@ function patchExtensionJs(content) {
   return [updated, statusLines];
 }
 
+// Render-blocking CSS at HTML-template level.
+//
+// Without this, theme.css is only injected after `enhance.js` finishes
+// importing and runs `injectStyles()`. By that time the host has already
+// painted with its own default theme, producing a 100 ms – 1.5 s flash
+// of host-default styling on every webview open. Patching the HTML
+// template adds head links that load in parallel with the host's
+// own `index.css`, so the very first paint already wears incipit's
+// colours.
+//
+// Anchor: the host template contains exactly one
+//   <link href="${H}" rel="stylesheet">
+// where `H` is the `vscode.Uri` for `webview/index.css`. We append our
+// own links right after it; their hrefs reuse `H.toString().replace(...)`
+// so we never depend on a minified-variable name beyond `H` itself
+// (which is the same name the anchor already uses).
+//
+// Strip-and-reinject pattern: a prior apply may have written one
+// palette's links; if the user later switched palette and re-runs apply,
+// we strip any prior `H.toString().replace(...)` link block back to the
+// bare anchor before injecting the active palette's set. Idempotent
+// when the active palette already matches.
+function patchExtensionHtmlHead(content, theme) {
+  const palette = (theme && theme.palette) === 'warm-white' ? 'warm-white' : 'warm-black';
+  const wantWarmWhite = palette === 'warm-white';
+
+  const ANCHOR = '<link href="${H}" rel="stylesheet">';
+  // Match anchor + 1..N of our own injected links (each carries the
+  // unique `H.toString().replace` marker).
+  const STRIP_RE =
+    /(<link href="\$\{H\}" rel="stylesheet">)(?:<link [^>]*\$\{H\.toString\(\)\.replace[^>]*>)+/;
+  // Single-anchor sanity check after stripping.
+  const ANCHOR_RE = /<link href="\$\{H\}" rel="stylesheet">/g;
+
+  // The replace regexes anchor to end-of-string (with optional `?` /
+  // `#`) so we only match the filename segment, never a parent path
+  // that happens to contain the literal "index.css".
+  // Reuse the same ids that `enhance.js > injectStyles()` checks. Without
+  // these ids, the first-paint head links work, but enhance.js later appends a
+  // duplicate copy of the same stylesheet, forcing an avoidable CSS parse /
+  // cascade pass right in the boot window.
+  const themeLink =
+    '<link id="claude-enhance-styles-link" href="${H.toString().replace(/index\\.css(?=$|[?#])/,\'theme.css\')}" rel="stylesheet">';
+  const wwLink = wantWarmWhite
+    ? '<link id="incipit-warm-white-link" href="${H.toString().replace(/index\\.css(?=$|[?#])/,\'warm-white-override.css\')}" rel="stylesheet">'
+    : '';
+  // NOTE — `modulepreload` was tried as a third hint to start fetching
+  // enhance.js in parallel with index.js, but webview CSP is
+  // `script-src 'nonce-${D}' https://cdnjs.cloudflare.com` (no 'self'),
+  // so a `<link rel="modulepreload">` without a nonce is blocked by
+  // CSP. Chromium then poisons the module cache for that URL, and the
+  // subsequent dynamic `import('./enhance.js')` from inside index.js
+  // also fails — enhance.js never runs, host_probe never sets
+  // `data-incipit-*` attributes, and theme.css's selectors fail to
+  // match, leaving the page looking like the host default. Do not
+  // re-add modulepreload here unless we also write the per-request
+  // nonce into the link tag (currently we have no clean way to thread
+  // `${D}` into the patched fragment without more parser surgery).
+
+  const desired = ANCHOR + themeLink + wwLink;
+
+  // Always strip-and-reinject. Using `content.includes(desired)` as
+  // the "already" check was wrong because `desired` could be a prefix
+  // of the actual patched block (e.g., a previous apply added an
+  // extra link after `desired`); `includes` would return true and
+  // the stale extra link would be left in place. Strip first, then
+  // compare the stripped text to "what would be patched fresh" — if
+  // they're equivalent we report 已存在 without writing.
+  const stripped = content.replace(STRIP_RE, '$1');
+  const baseMatches = stripped.match(ANCHOR_RE) || [];
+  if (baseMatches.length !== 1) {
+    throw new Error(
+      `HTML head anchor not unique after strip (found ${baseMatches.length}); ` +
+      'aborting head-link patch.',
+    );
+  }
+
+  const updated = stripped.replace(ANCHOR, desired);
+  if (updated === content) {
+    return [content, `${padLabel('HTML head 提速')}: 已存在 (${palette})`];
+  }
+  return [updated, `${padLabel('HTML head 提速')}: 已写入 (${palette})`];
+}
+
 function patchMarkdownChildren(content) {
   const stripped = content.replace(
     MARKDOWN_LEGACY_CHILDREN_RE,
@@ -620,9 +984,165 @@ function patchMarkdownChildren(content) {
   });
 }
 
-function patchWebviewIndex(content) {
-  let [updated, markdownStatus] = patchMarkdownChildren(content);
-  const statusLines = [markdownStatus];
+function patchWebviewConfig(content, features, theme, language) {
+  const preamble = buildWebviewConfigPreamble(features, theme, language);
+  const hadPreamble = WEBVIEW_CONFIG_RE.test(content);
+  const stripped = content.replace(WEBVIEW_CONFIG_RE, '');
+  const updated = preamble + stripped;
+  if (updated === content) {
+    return [content, `${padLabel('webview config')}: 已存在`];
+  }
+  return [
+    updated,
+    `${padLabel('webview config')}: ${hadPreamble ? '已更新' : '已写入'}`,
+  ];
+}
+
+function patchMonacoDiffTheme(content) {
+  const hardcoded = (content.match(MONACO_DIFF_THEME_HARDCODED_RE) || []).length;
+  const legacyPatched = (content.match(MONACO_DIFF_THEME_LEGACY_PATCHED_RE) || []).length;
+  const patched = (content.match(MONACO_DIFF_THEME_PATCHED_RE) || []).length;
+  if (hardcoded === 0 && legacyPatched === 0 && patched === 2) {
+    return [content, `${padLabel('diff 主题')}: 已存在`];
+  }
+  if (hardcoded + legacyPatched + patched !== 2) {
+    throw new Error(`Claude Code 扩展结构已变化,未找到唯一的 diff 主题可补丁位置。`);
+  }
+  const updated = content
+    .replace(MONACO_DIFF_THEME_HARDCODED_RE, `theme:${MONACO_DIFF_THEME_EXPR}`)
+    .replace(MONACO_DIFF_THEME_LEGACY_PATCHED_RE, `theme:${MONACO_DIFF_THEME_EXPR}`);
+  return [
+    updated,
+    `${padLabel('diff 主题')}: 已写入`,
+  ];
+}
+
+function patchMonacoDiffFont(content) {
+  const hardcoded = (content.match(MONACO_DIFF_FONT_HARDCODED_RE) || []).length;
+  const legacyPatched = (content.match(MONACO_DIFF_FONT_LEGACY_PATCHED_RE) || []).length;
+  const oldPatched = (content.match(MONACO_DIFF_FONT_OLD_PATCHED_RE) || []).length;
+  const patched = (content.match(MONACO_DIFF_FONT_PATCHED_RE) || []).length;
+  if (hardcoded === 0 && legacyPatched === 0 && oldPatched === 0 && patched === 2) {
+    return [content, `${padLabel('diff 字体/行号')}: 已存在`];
+  }
+  if (hardcoded + legacyPatched + oldPatched + patched !== 2) {
+    throw new Error(`Claude Code 扩展结构已变化,未找到唯一的 diff 字体/行号可补丁位置。`);
+  }
+  return [
+    content
+      .replace(MONACO_DIFF_FONT_HARDCODED_RE, MONACO_DIFF_FONT_LAYOUT_OPTIONS)
+      .replace(MONACO_DIFF_FONT_LEGACY_PATCHED_RE, MONACO_DIFF_FONT_LAYOUT_OPTIONS)
+      .replace(MONACO_DIFF_FONT_OLD_PATCHED_RE, MONACO_DIFF_FONT_LAYOUT_OPTIONS),
+    `${padLabel('diff 字体/行号')}: 已写入`,
+  ];
+}
+
+function patchMonacoDiffWordWrap(content) {
+  const hardcoded = (content.match(MONACO_DIFF_WORD_WRAP_HARDCODED_RE) || []).length;
+  const patched = (content.match(MONACO_DIFF_WORD_WRAP_PATCHED_RE) || []).length;
+  if (hardcoded === 0 && patched === 2) {
+    return [content, `${padLabel('diff 换行')}: 已存在`];
+  }
+  if (hardcoded + patched !== 2) {
+    throw new Error(`Claude Code 扩展结构已变化,未找到唯一的 diff 换行可补丁位置。`);
+  }
+  return [
+    content.replace(MONACO_DIFF_WORD_WRAP_HARDCODED_RE, 'wordWrap:"off",wrappingIndent:"same"'),
+    `${padLabel('diff 换行')}: 已写入`,
+  ];
+}
+
+function patchMonacoDiffOverview(content) {
+  const hardcoded = (content.match(MONACO_DIFF_OVERVIEW_HARDCODED_RE) || []).length;
+  const patched = (content.match(MONACO_DIFF_OVERVIEW_PATCHED_RE) || []).length;
+  const inlineLayoutPatched = (content.match(MONACO_DIFF_OVERVIEW_INLINE_LAYOUT_PATCHED_RE) || []).length;
+  // The inline diff editor already ships with `renderOverviewRuler:!1`; the
+  // expanded modal is the single `!0` we migrate. Therefore the final patched
+  // state has two `!1` matches for this option prefix. The inline preview may
+  // later be forced into single-column mode (`renderSideBySide:!1`), so accept
+  // that as one of the two overview-patched diff editors.
+  if (hardcoded === 0 && patched + inlineLayoutPatched === 2) {
+    return [content, `${padLabel('diff 概览条')}: 已存在`];
+  }
+  if (hardcoded !== 1 || patched + inlineLayoutPatched !== 1) {
+    throw new Error(`Claude Code 扩展结构已变化,未找到唯一的 diff 概览条可补丁位置。`);
+  }
+  return [
+    content.replace(MONACO_DIFF_OVERVIEW_HARDCODED_RE, 'readOnly:!0,renderSideBySide:!0,renderOverviewRuler:!1'),
+    `${padLabel('diff 概览条')}: 已写入`,
+  ];
+}
+
+function patchMonacoDiffInlineLayout(content) {
+  const layoutHardcoded = (content.match(MONACO_DIFF_INLINE_LAYOUT_HARDCODED_RE) || []).length;
+  const layoutPatched = (content.match(MONACO_DIFF_INLINE_LAYOUT_PATCHED_RE) || []).length;
+  const resizeHardcoded = (content.match(MONACO_DIFF_INLINE_RESIZE_HARDCODED_RE) || []).length;
+  const resizePatched = (content.match(MONACO_DIFF_INLINE_RESIZE_PATCHED_RE) || []).length;
+
+  if (layoutHardcoded === 0 && layoutPatched === 1 && resizeHardcoded === 0 && resizePatched === 1) {
+    return [content, `${padLabel('diff inline 布局')}: 已存在`];
+  }
+  if (layoutHardcoded + layoutPatched !== 1 || resizeHardcoded + resizePatched !== 1) {
+    throw new Error(`Claude Code 扩展结构已变化,未找到唯一的 inline diff 布局可补丁位置。`);
+  }
+
+  const updated = content
+    .replace(
+      MONACO_DIFF_INLINE_LAYOUT_HARDCODED_RE,
+      '$1renderSideBySide:!1$2',
+    )
+    .replace(
+      MONACO_DIFF_INLINE_RESIZE_HARDCODED_RE,
+      '$1(!0),$3.updateOptions({renderSideBySide:!1})',
+    );
+  return [
+    updated,
+    `${padLabel('diff inline 布局')}: 已写入`,
+  ];
+}
+
+function patchMonacoDiffModalLayout(content) {
+  const hardcoded = (content.match(MONACO_DIFF_MODAL_LAYOUT_HARDCODED_RE) || []).length;
+  const patched = (content.match(MONACO_DIFF_MODAL_LAYOUT_PATCHED_RE) || []).length;
+
+  if (hardcoded === 0 && patched === 1) {
+    return [content, `${padLabel('diff modal 布局')}: 已存在`];
+  }
+  if (hardcoded + patched !== 1) {
+    throw new Error(`Claude Code 扩展结构已变化,未找到唯一的 modal diff 布局可补丁位置。`);
+  }
+  return [
+    content.replace(
+      MONACO_DIFF_MODAL_LAYOUT_HARDCODED_RE,
+      '$1renderSideBySide:!1$2',
+    ),
+    `${padLabel('diff modal 布局')}: 已写入`,
+  ];
+}
+
+function patchMonacoDiffModalScrollbar(content) {
+  const hardcoded = (content.match(MONACO_DIFF_MODAL_SCROLLBAR_HARDCODED_RE) || []).length;
+  const legacyHidden = (content.match(MONACO_DIFF_MODAL_SCROLLBAR_LEGACY_HIDDEN_RE) || []).length;
+  if (hardcoded === 1 && legacyHidden === 0) {
+    return [content, `${padLabel('diff 横向滚动')}: 已存在`];
+  }
+  if (hardcoded === 0 && legacyHidden === 1) {
+    return [
+      content.replace(MONACO_DIFF_MODAL_SCROLLBAR_LEGACY_HIDDEN_RE, 'scrollbar:{vertical:"auto",horizontal:"auto"}'),
+      `${padLabel('diff 横向滚动')}: 已恢复`,
+    ];
+  }
+  if (hardcoded + legacyHidden !== 1) {
+    throw new Error(`Claude Code 扩展结构已变化,未找到唯一的 diff 横向滚动可补丁位置。`);
+  }
+  return [content, `${padLabel('diff 横向滚动')}: 已存在`];
+}
+
+function patchWebviewIndex(content, features, theme, language) {
+  let [updated, configStatus] = patchWebviewConfig(content, features, theme, language);
+  let markdownStatus;
+  [updated, markdownStatus] = patchMarkdownChildren(updated);
+  const statusLines = [configStatus, markdownStatus];
 
   // Remove the legacy `acquireVsCodeApi` idempotency wrapper that earlier
   // development builds prepended to this file. Its only consumer has been
@@ -631,6 +1151,34 @@ function patchWebviewIndex(content) {
     /\(function\(\)\{if\(window\.__cceApiWrap\)[\s\S]*?\}\)\(\);\n/,
     '',
   );
+
+  let diffThemeStatus;
+  [updated, diffThemeStatus] = patchMonacoDiffTheme(updated);
+  statusLines.push(diffThemeStatus);
+
+  let diffFontStatus;
+  [updated, diffFontStatus] = patchMonacoDiffFont(updated);
+  statusLines.push(diffFontStatus);
+
+  let diffWrapStatus;
+  [updated, diffWrapStatus] = patchMonacoDiffWordWrap(updated);
+  statusLines.push(diffWrapStatus);
+
+  let diffOverviewStatus;
+  [updated, diffOverviewStatus] = patchMonacoDiffOverview(updated);
+  statusLines.push(diffOverviewStatus);
+
+  let diffInlineLayoutStatus;
+  [updated, diffInlineLayoutStatus] = patchMonacoDiffInlineLayout(updated);
+  statusLines.push(diffInlineLayoutStatus);
+
+  let diffModalLayoutStatus;
+  [updated, diffModalLayoutStatus] = patchMonacoDiffModalLayout(updated);
+  statusLines.push(diffModalLayoutStatus);
+
+  let diffScrollbarStatus;
+  [updated, diffScrollbarStatus] = patchMonacoDiffModalScrollbar(updated);
+  statusLines.push(diffScrollbarStatus);
 
   const hasDynamicImport = DYNAMIC_IMPORT_RE.test(updated);
   const hasStaticImport = STATIC_IMPORT_RE.test(updated);
@@ -655,16 +1203,23 @@ function patchWebviewIndex(content) {
 // ============================================================
 
 function installClaudeCodeVSCodeEnhance(resourceRoot, options = {}) {
-  const { home = null } = options;
-  const target = findLatestClaudeCodeExtension(home);
+  // Caller may supply a pre-resolved `target` (from the new multi-target
+  // picker flow); otherwise we fall back to legacy "find the latest
+  // ~/.vscode/extensions/anthropic.claude-code-*" detection. Either path
+  // produces a target that already carries `settingsPath`.
+  const { home = null, target: presetTarget = null, extensionsDir = null, settingsPath = null } = options;
+  const target = presetTarget || findLatestClaudeCodeExtension({ home, extensionsDir, settingsPath });
   const webviewDir = path.dirname(target.webviewIndexJsPath);
 
+  pruneRetiredConfigKeys();
   const features = getFeatures();
   const theme = getTheme();
-  const enhancePreamble = buildEnhancePreamble(features);
+  const language = getLanguage() || 'en';
+  const enhancePreamble = buildEnhancePreamble(features, theme, language);
   const themeOverrideBlock = buildThemeOverrideBlock(theme);
 
   const rootResourceStatuses = [];
+  const rootWebviewFiles = [];
   let enhanceScriptWritten = false;
   for (const [relativePath, targetName] of ROOT_WEBVIEW_FILES) {
     const src = resourceFilePath(resourceRoot, relativePath);
@@ -678,6 +1233,11 @@ function installClaudeCodeVSCodeEnhance(resourceRoot, options = {}) {
       written = copyIfChanged(src, dst);
     }
     if (targetName === ENHANCE_TARGET_NAME) enhanceScriptWritten = written;
+    rootWebviewFiles.push({
+      name: targetName,
+      path: dst,
+      written,
+    });
     const label = `${targetName} 复制`;
     rootResourceStatuses.push(
       written
@@ -687,10 +1247,12 @@ function installClaudeCodeVSCodeEnhance(resourceRoot, options = {}) {
   }
 
   // Prune any legacy asset subtrees that earlier versions used to ship.
+  let legacyAssetTreesPruned = 0;
   for (const legacy of LEGACY_ASSET_TREES) {
     const legacyDir = path.join(webviewDir, legacy);
     if (fs.existsSync(legacyDir)) {
       fs.rmSync(legacyDir, { recursive: true, force: true });
+      legacyAssetTreesPruned++;
     }
   }
 
@@ -698,12 +1260,19 @@ function installClaudeCodeVSCodeEnhance(resourceRoot, options = {}) {
   let assetWrittenTotal = 0;
   let assetTotal = 0;
   const assetStatusLines = [];
+  const assetTrees = [];
   for (const treeName of LOCAL_ASSET_TREES) {
     const srcTree = path.join(resourceRoot, 'data', treeName);
     const dstTree = path.join(webviewDir, treeName);
     const [written, total] = syncAssetTree(srcTree, dstTree);
     assetWrittenTotal += written;
     assetTotal += total;
+    assetTrees.push({
+      name: treeName,
+      path: dstTree,
+      written,
+      total,
+    });
     const label = `${treeName} 资源`;
     assetStatusLines.push(
       written === 0
@@ -714,7 +1283,10 @@ function installClaudeCodeVSCodeEnhance(resourceRoot, options = {}) {
 
   // `extension.js`
   const extJsOriginal = fs.readFileSync(target.extensionJsPath, 'utf8');
-  const [extJsUpdatedText, extStatusLines] = patchExtensionJs(extJsOriginal);
+  let [extJsUpdatedText, extStatusLines] = patchExtensionJs(extJsOriginal);
+  let extJsHeadStatus;
+  [extJsUpdatedText, extJsHeadStatus] = patchExtensionHtmlHead(extJsUpdatedText, theme);
+  extStatusLines.push(extJsHeadStatus);
   const extJsUpdated = extJsUpdatedText !== extJsOriginal;
   if (extJsUpdated) {
     fs.writeFileSync(target.extensionJsPath, extJsUpdatedText, 'utf8');
@@ -722,15 +1294,17 @@ function installClaudeCodeVSCodeEnhance(resourceRoot, options = {}) {
 
   // `webview/index.js`
   const webviewOriginal = fs.readFileSync(target.webviewIndexJsPath, 'utf8');
-  const [webviewUpdatedText, webviewStatusLines] = patchWebviewIndex(webviewOriginal);
+  const [webviewUpdatedText, webviewStatusLines] = patchWebviewIndex(webviewOriginal, features, theme, language);
   const webviewUpdated = webviewUpdatedText !== webviewOriginal;
   if (webviewUpdated) {
     fs.writeFileSync(target.webviewIndexJsPath, webviewUpdatedText, 'utf8');
   }
 
-  // System fonts plus `chat.fontFamily` / `chat.fontSize`.
+  // System fonts plus `chat.fontFamily` / `chat.fontSize`. The settings
+  // path comes from the resolved target so custom Cursor / Scoop /
+  // portable installs write into the right `User/settings.json`.
   const serifWritten = installSerifSystemFonts(resourceRoot);
-  const chatFontUpdated = setChatFontToSerif(theme.bodyFontSize);
+  const chatFontUpdated = setChatFontToSerif(theme.bodyFontSize, target.settingsPath);
   const serifStatus = serifWritten > 0
     ? `已写入 ${serifWritten}/${SYSTEM_FONT_FILES.length}`
     : `已存在 (${SYSTEM_FONT_FILES.length} 个)`;
@@ -756,6 +1330,30 @@ function installClaudeCodeVSCodeEnhance(resourceRoot, options = {}) {
     assetFilesTotal: assetTotal,
     serifFontsInstalled: serifWritten,
     chatFontSettingUpdated: chatFontUpdated,
+    report: {
+      webviewDir,
+      rootWebviewFiles,
+      assetTrees,
+      extensionJs: {
+        path: target.extensionJsPath,
+        updated: extJsUpdated,
+        statusLines: extStatusLines,
+      },
+      webviewIndex: {
+        path: target.webviewIndexJsPath,
+        updated: webviewUpdated,
+        statusLines: webviewStatusLines,
+      },
+      settings: {
+        path: target.settingsPath,
+        updated: chatFontUpdated,
+      },
+      systemFonts: {
+        written: serifWritten,
+        total: SYSTEM_FONT_FILES.length,
+      },
+      legacyAssetTreesPruned,
+    },
     statusLines,
     features,
     theme,

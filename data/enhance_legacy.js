@@ -1,0 +1,6866 @@
+import { ATTR, SEL, closestByAttr } from './host_probe.js';
+import { CFG, assetURL, log, warn, whenDOMReady } from './enhance_shared.js';
+
+/**
+ * Heavy interaction module for the patched Claude Code UI.
+ *
+ * Bootstrap handles first paint and split modules now own typography,
+ * thinking, and footer/badge surfaces. This module keeps the remaining
+ * interaction-heavy systems: transcript actions, local history edit/rerun,
+ * tool folding, diff islands, and related host/fiber helpers.
+ *
+ * Math gating: the old host-class blocklist is gone. `preprocessMarkdownMath`
+ * is only ever called from the patched `react-markdown` handoff, which
+ * Claude Code uses exclusively for assistant messages. User bubbles bypass
+ * it entirely, so their DOM text never receives the placeholder token and
+ * `math_rewriter` leaves them alone. DOM-level protection still hard-blocks
+ * live `contenteditable` subtrees and diff surfaces, where source text must
+ * stay literal even if it contains markdown or TeX-looking syntax.
+ */
+
+(() => {
+  'use strict';
+
+  // Bootstrap/shared owns config, logging, host probing, styles, app vars,
+  // body-bold, DOM freeze, and DOM-ready scheduling. The legacy module now
+  // only owns the interaction-heavy surfaces that have not been split yet.
+
+  // ========== 1. asset-loader ==========
+
+  const effortBrainPreloadImages = [];
+  let effortBrainPreloadStarted = false;
+
+  function preloadEffortBrainIcons() {
+    if (effortBrainPreloadStarted) return;
+    effortBrainPreloadStarted = true;
+
+    const levels = ['low', 'medium', 'high', 'xhigh', 'max'];
+    // CSS swaps external SVG background-images on every effort change. Without
+    // an explicit warm-up, the first visit to a level can briefly paint an
+    // empty `::before` while Chromium loads/decodes that SVG. Preload both ink
+    // sets: the inactive set is tiny, and this also covers the short moment
+    // before warm-white overrides replace the dark defaults.
+    const files = [];
+    for (const level of levels) {
+      files.push('effort-brain/effort-brain-' + level + '-white.svg');
+      files.push('effort-brain/effort-brain-' + level + '.svg');
+    }
+
+    for (const file of files) {
+      const href = assetURL(file);
+      const id = 'incipit-preload-' + file.replace(/[^a-z0-9_-]+/gi, '-');
+      if (!document.getElementById(id)) {
+        const link = document.createElement('link');
+        link.id = id;
+        link.rel = 'preload';
+        link.as = 'image';
+        link.href = href;
+        document.head.appendChild(link);
+      }
+
+      const img = new Image();
+      img.decoding = 'async';
+      img.src = href;
+      effortBrainPreloadImages.push(img);
+      if (typeof img.decode === 'function') {
+        img.decode().catch(() => { /* CSS background can still use the URL. */ });
+      }
+    }
+  }
+
+  // Typography, math rendering, CJK punctuation, and code highlighting moved to enhance_typography.js.
+
+  // ========== 8. user-copy ==========
+  //
+  // Only user message bubbles get a copy button. Assistant replies and tool
+  // output are intentionally left alone because reconstructing source text
+  // from their DOM is much less reliable.
+  //
+  // The button lives in a transparent sibling row on the host container so
+  // bubble padding stays compact.
+
+  // Outline SVG icons that inherit `currentColor`.
+  const COPY_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>' +
+    '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>' +
+    '</svg>';
+  const CHECK_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<polyline points="20 6 9 17 4 12"/>' +
+    '</svg>';
+  const EDIT_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M12 20h9"/>' +
+    '<path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>' +
+    '</svg>';
+  // Reprise arrow (rerun this turn): a quiet single-stroke loop that reads
+  // as rerun without sharing the edit pencil's writing-tool metaphor.
+  // Lives only on user bubbles. Live state takes terra orange via CSS;
+  // disabled state is just a colour + opacity shift (no slash overlay) —
+  // rerun is a single primitive action, not a slash-able verb like edit/delete.
+  const RERUN_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M18.35 7.35c-2.44-2.72-6.7-3-9.48-.56C5.9 9.4 5.8 14 8.66 16.76c2.65 2.56 6.88 2.52 9.45-.1 1.22-1.24 1.88-2.89 1.84-4.58"/>' +
+    '<path d="M18.35 7.35l-.56-3.58"/>' +
+    '<path d="M18.35 7.35l-3.6.48"/>' +
+    '</svg>';
+  // More (vertical three dots): opens a dropdown listing copy variants.
+  const MORE_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">' +
+    '<circle cx="12" cy="5.5" r="1.6"/>' +
+    '<circle cx="12" cy="12" r="1.6"/>' +
+    '<circle cx="12" cy="18.5" r="1.6"/>' +
+    '</svg>';
+  // Fork (git-branch Y): main button on user bubbles, also reused inside
+  // the More dropdown for "Fork with code rewind". Lucide git-branch
+  // shape — vertical trunk + side node + arc — reads as "branch out"
+  // rather than "fork into pieces". Different metaphor from rerun's
+  // closed loop, so the two main buttons stay visually distinct.
+  const FORK_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<line x1="6" y1="3" x2="6" y2="15"/>' +
+    '<circle cx="18" cy="6" r="3"/>' +
+    '<circle cx="6" cy="18" r="3"/>' +
+    '<path d="M18 9a9 9 0 0 1-9 9"/>' +
+    '</svg>';
+  // Pure rewind (Lucide rotate-ccw): full-size icon used by "Rewind code
+  // only" in the More dropdown. Arrow nub at top-LEFT, deliberately
+  // mirrored from RERUN_ICON_SVG (arrow at top-RIGHT) so a 16px slot can
+  // tell them apart even without reading the label.
+  const REWIND_ONLY_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M3 12a9 9 0 1 0 3.5-7.1L3 8"/>' +
+    '<polyline points="3 3 3 8 8 8"/>' +
+    '</svg>';
+  const COPY_AS_TEXT_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M5 7h14"/>' +
+    '<path d="M5 12h14"/>' +
+    '<path d="M5 17h9"/>' +
+    '</svg>';
+  const COPY_AS_MARKDOWN_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="m8 8-4 4 4 4"/>' +
+    '<path d="m16 8 4 4-4 4"/>' +
+    '<path d="m14 6-4 12"/>' +
+    '</svg>';
+  // Streaming-disabled variant for edit: original artwork + a single
+  // top-left → bottom-right slash painted last so it sits above the
+  // icon body. Direction perpendicular to the pen (which runs
+  // upper-right → lower-left); a parallel slash would just read as a
+  // thicker pen. Stroke a hair thicker than 1.75 so the cancel mark
+  // reads at a glance; currentColor follows the disabled foreground.
+  const EDIT_ICON_DISABLED_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M12 20h9"/>' +
+    '<path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>' +
+    '<line x1="3.5" y1="3.5" x2="20.5" y2="20.5" stroke-width="2"/>' +
+    '</svg>';
+
+  // Inline-edit action icons. Two SVGs replace the three (copy/edit/
+  // delete) while editing, matching their stroke style so the row
+  // reads as the same family. Cancel = X mark; save = checkmark.
+  const CANCEL_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<line x1="6" y1="6" x2="18" y2="18"/>' +
+    '<line x1="18" y1="6" x2="6" y2="18"/>' +
+    '</svg>';
+  const SAVE_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<polyline points="5 12 10 17 19 7"/>' +
+    '</svg>';
+  // Inline editor chip strip icons. Document/file glyph for ide_*
+  // refs; small × for chip remove; plus for the add-image affordance.
+  // All `currentColor` so warm-white override only swaps the chip's
+  // text colour, not the geometry.
+  const CHIP_FILE_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M14 3 H7 A2 2 0 0 0 5 5 V19 A2 2 0 0 0 7 21 H17 A2 2 0 0 0 19 19 V8 Z"/>' +
+    '<path d="M14 3 V8 H19"/>' +
+    '</svg>';
+  const CHIP_X_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<line x1="7" y1="7" x2="17" y2="17"/>' +
+    '<line x1="17" y1="7" x2="7" y2="17"/>' +
+    '</svg>';
+  const CHIP_PLUS_ICON_SVG =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<line x1="12" y1="6" x2="12" y2="18"/>' +
+    '<line x1="6" y1="12" x2="18" y2="12"/>' +
+    '</svg>';
+
+  let transcriptMutationSeq = 0;
+  let transcriptMutationListenerBound = false;
+  const transcriptMutationPending = new Map();
+
+  function flashCopied(btn) {
+    if (!btn) return;
+    // Restore to whatever the button's resting icon is (rerun / more
+    // / copy / etc), not the global copy icon. Fall back to current
+    // innerHTML for buttons that pre-date the live-icon stash.
+    const restore = btn._incipitLiveIcon || btn.innerHTML || COPY_ICON_SVG;
+    btn.innerHTML = CHECK_ICON_SVG;
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.innerHTML = restore;
+      btn.classList.remove('copied');
+    }, 1200);
+  }
+
+  async function copyText(text, btn) {
+    try {
+      await navigator.clipboard.writeText(text);
+      if (btn) flashCopied(btn);
+    } catch (err) {
+      warn('Copy failed:', err);
+    }
+  }
+
+  // Markdown → readable plain text. Drops inline marks (`#`, `**`,
+  // backticks, link URLs) but preserves structure (paragraph breaks,
+  // list indentation, code body). Distinct from `textContent` which
+  // collapses indentation and drops list markers entirely.
+  function markdownToPlainText(md) {
+    if (!md) return '';
+    let text = String(md);
+    // Fenced code blocks: keep body, drop fences and language tag.
+    text = text.replace(/```[a-zA-Z0-9_-]*\n([\s\S]*?)\n```/g, '$1');
+    text = text.replace(/```([\s\S]*?)```/g, '$1');
+    // Inline code: keep content, drop backticks.
+    text = text.replace(/`([^`\n]+)`/g, '$1');
+    // ATX headings: drop leading hashes (and trailing hashes).
+    text = text.replace(/^\s*#{1,6}\s+(.*?)\s*#*\s*$/gm, '$1');
+    // Setext headings: drop the underline.
+    text = text.replace(/^([^\n]+)\n[=-]{3,}\s*$/gm, '$1');
+    // Images first (so the alt-text-only form survives the link pass).
+    text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');
+    // Links: keep label, drop URL.
+    text = text.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+    // Reference-style links: keep label.
+    text = text.replace(/\[([^\]]+)\]\[[^\]]*\]/g, '$1');
+    // Bold + italic combinations (handle longer markers first).
+    text = text.replace(/\*\*\*([^*\n]+)\*\*\*/g, '$1');
+    text = text.replace(/___([^_\n]+)___/g, '$1');
+    text = text.replace(/\*\*([^*\n]+)\*\*/g, '$1');
+    text = text.replace(/__([^_\n]+)__/g, '$1');
+    text = text.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1$2');
+    text = text.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, '$1$2');
+    // Strikethrough.
+    text = text.replace(/~~([^~\n]+)~~/g, '$1');
+    // Blockquotes: drop leading > markers (keep indent).
+    text = text.replace(/^(\s*)>\s?/gm, '$1');
+    // Unordered list markers → "- " (consistent indent-friendly form).
+    text = text.replace(/^(\s*)[*+\-]\s+/gm, '$1- ');
+    // Horizontal rules → blank line.
+    text = text.replace(/^[ \t]*[-*_]{3,}[ \t]*$/gm, '');
+    // Tables: drop separator rows (|---|---|), keep cell text but
+    // collapse pipes to tabs for readability.
+    text = text.replace(/^[ \t]*\|?[ \t]*[-:|][-:|\s]*\|?[ \t]*$/gm, '');
+    text = text.replace(/\|/g, '\t');
+    // Collapse 3+ blank lines down to 2.
+    text = text.replace(/\n{3,}/g, '\n\n');
+    return text.trim();
+  }
+
+  // Body-portal dropdown anchored to a button. Closes on outside click
+  // or Esc. Items: { label, icon, onClick } array. Returns the popup node.
+  // Style hooks live in theme.css under `[data-incipit-action-dropdown]`
+  // and pick up palette via warm-white-override.css.
+  function openActionDropdown(anchorBtn, items) {
+    // Toggle behaviour: clicking the same anchor that already owns an
+    // open dropdown closes it. We tag the popup with its anchor so we
+    // can distinguish "clicked the anchor again" (close, don't reopen)
+    // from "clicked a different anchor" (close old, open new).
+    const existing = document.querySelector('[data-incipit-action-dropdown]');
+    if (existing) {
+      const wasForThisAnchor = existing._incipitAnchor === anchorBtn;
+      existing.remove();
+      if (existing._incipitAnchor) existing._incipitAnchor._incipitDropdownOpen = false;
+      if (wasForThisAnchor) return null;
+    }
+
+    const popup = document.createElement('div');
+    popup.setAttribute('data-incipit-action-dropdown', '');
+    popup._incipitAnchor = anchorBtn;
+    if (anchorBtn) anchorBtn._incipitDropdownOpen = true;
+    for (const item of items) {
+      // Separators are 1px rules — purely visual grouping (rewind block
+      // above, copy block below, etc). No click handlers.
+      if (item && item.type === 'separator') {
+        const sep = document.createElement('div');
+        sep.setAttribute('data-incipit-action-dropdown-separator', '');
+        popup.appendChild(sep);
+        continue;
+      }
+      const row = document.createElement('button');
+      row.setAttribute('data-incipit-action-dropdown-item', '');
+      row.type = 'button';
+      // Disabled items render dimmed and swallow the click silently.
+      // We snapshot disabled state at dropdown-open time; if state
+      // flips while the popup is open, that's tolerable (the popup is
+      // ephemeral — close + reopen and it picks up the new state).
+      const isDisabled = !!item.disabled;
+      if (isDisabled) {
+        row.dataset.incipitDisabled = '1';
+        row.setAttribute('aria-disabled', 'true');
+      }
+      if (item.title) row.title = item.title;
+      if (item.icon) {
+        const icon = document.createElement('span');
+        icon.setAttribute('data-incipit-action-dropdown-icon', '');
+        icon.innerHTML = item.icon;
+        row.appendChild(icon);
+      }
+      const label = document.createElement('span');
+      label.setAttribute('data-incipit-action-dropdown-label', '');
+      label.textContent = item.label;
+      row.appendChild(label);
+      row.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        if (isDisabled) return;
+        try { item.onClick(); } catch (error) { warn('dropdown action failed:', error); }
+        close();
+      });
+      popup.appendChild(row);
+    }
+
+    document.body.appendChild(popup);
+
+    // Position. We measure after append so getBoundingClientRect knows
+    // popup's natural width. Default: below + right-aligned to the
+    // anchor; flip up if there isn't room below.
+    const anchorRect = anchorBtn.getBoundingClientRect();
+    const popupRect = popup.getBoundingClientRect();
+    let top = anchorRect.bottom + 4;
+    let left = anchorRect.right - popupRect.width;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    if (left < 8) left = 8;
+    if (left + popupRect.width > vw - 8) left = vw - 8 - popupRect.width;
+    if (top + popupRect.height > vh - 8) top = anchorRect.top - 4 - popupRect.height;
+    popup.style.top = top + 'px';
+    popup.style.left = left + 'px';
+
+    let closed = false;
+    function close() {
+      if (closed) return;
+      closed = true;
+      popup.remove();
+      if (anchorBtn) anchorBtn._incipitDropdownOpen = false;
+      document.removeEventListener('mousedown', onDocDown, true);
+      document.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('blur', close);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+    }
+    function onDocDown(e) {
+      if (popup.contains(e.target)) return;
+      // Click on the anchor: let the click handler reach openActionDropdown
+      // again, which detects the same-anchor case and closes there. If we
+      // closed here, click would re-open immediately (flicker).
+      if (anchorBtn === e.target || (anchorBtn.contains && anchorBtn.contains(e.target))) return;
+      close();
+    }
+    function onKey(e) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        close();
+      }
+    }
+    // Defer listener bind to next tick so the click that opened us
+    // doesn't immediately close us.
+    setTimeout(() => {
+      document.addEventListener('mousedown', onDocDown, true);
+      document.addEventListener('keydown', onKey, true);
+      window.addEventListener('blur', close);
+      window.addEventListener('resize', close);
+      window.addEventListener('scroll', close, true);
+    }, 0);
+
+    return popup;
+  }
+
+  function transcriptContent(record) {
+    if (!record || typeof record !== 'object') return null;
+    if (record.message && typeof record.message === 'object' && 'content' in record.message) {
+      return record.message.content;
+    }
+    if ('content' in record) return record.content;
+    return null;
+  }
+
+  function unwrapTranscriptContentBlock(block) {
+    if (block && typeof block === 'object' &&
+        block.content && typeof block.content === 'object' &&
+        typeof block.content.type === 'string') {
+      return block.content;
+    }
+    return block;
+  }
+
+  // Classify a user record's content blocks for the rich inline editor.
+  // Returns { chips, proseText, hadArrayContent }. Walks the SY array
+  // (or wraps a string into a single-prose record), separates blocks
+  // into:
+  //   - "kept" chips (preserved across edit, individually removable):
+  //       * ide_opened_file / ide_selection  (auto-attached file refs)
+  //       * image                            (base64 image attachments)
+  //   - prose text (the user's own typed message; multiple text blocks
+  //     get joined with '\n' for the textarea, edited as one)
+  //
+  // Each chip carries its original index in `record.content`; on save
+  // we send `{kind:'keep', index}` rather than re-uploading the whole
+  // block (saves 100KB+ per image payload).
+  //
+  // Tag detection uses leading-tag regex against ide-host's actual
+  // wording. Bare-tag fallback covers phrasing drift in future Claude
+  // Code releases without inventing block types.
+  function classifyUserRecordBlocks(record) {
+    const out = { chips: [], proseText: '', hadArrayContent: false };
+    if (!record) return out;
+    const content = transcriptContent(record);
+    if (typeof content === 'string') {
+      out.proseText = content;
+      return out;
+    }
+    if (!Array.isArray(content)) return out;
+    out.hadArrayContent = true;
+
+    const proseParts = [];
+    let chipSeq = 0;
+    for (let i = 0; i < content.length; i++) {
+      const block = unwrapTranscriptContentBlock(content[i]);
+      if (!block || typeof block !== 'object') continue;
+
+      if (block.type === 'text' && typeof block.text === 'string') {
+        const meta = parseIdeRefText(block.text);
+        if (meta) {
+          out.chips.push({
+            chipId: 'k-' + (++chipSeq),
+            kind: 'keep',
+            index: i,
+            blockKind: meta.kind,
+            label: meta.label,
+            subLabel: meta.subLabel || null,
+            rawText: block.text,
+          });
+        } else {
+          proseParts.push(block.text);
+        }
+      } else if (block.type === 'image' && block.source) {
+        const src = block.source;
+        let dataUrl = null;
+        if (src.type === 'base64' &&
+            typeof src.data === 'string' &&
+            typeof src.media_type === 'string') {
+          dataUrl = `data:${src.media_type};base64,${src.data}`;
+        }
+        out.chips.push({
+          chipId: 'k-' + (++chipSeq),
+          kind: 'keep',
+          index: i,
+          blockKind: 'image',
+          mediaType: src.media_type || 'image/*',
+          dataUrl,
+        });
+      }
+      // Unknown / unrecognised block types are silently dropped from
+      // the editor view; they're already non-editable from the user's
+      // POV and forwarding an opaque blob would mislead the chip strip.
+    }
+    out.proseText = proseParts.join('\n');
+    return out;
+  }
+
+  // Recognise Claude Code's IDE-attached text wrappers. The host wraps
+  // an opened-file or line-selection notice as its own text block,
+  // prefixed with these literal phrases (verified against 154 + 18
+  // occurrences across 105 local sessions). We extract the file
+  // basename (and line range for selections) for the chip label; the
+  // raw text is kept on the chip descriptor so save's keep-by-index
+  // round-trips it byte-perfect to the model.
+  function parseIdeRefText(text) {
+    const opened = /^\s*<ide_opened_file>The user opened the file ([\s\S]+?) in the IDE\./.exec(text);
+    if (opened) {
+      return { kind: 'ide_opened_file', label: basenameFromPath(opened[1]), subLabel: null };
+    }
+    const selection = /^\s*<ide_selection>The user selected the lines (\d+) to (\d+) from ([\s\S]+?):/.exec(text);
+    if (selection) {
+      const start = parseInt(selection[1], 10);
+      const end = parseInt(selection[2], 10);
+      const path = selection[3];
+      return {
+        kind: 'ide_selection',
+        label: basenameFromPath(path),
+        subLabel: start === end ? `L${start}` : `L${start}–${end}`,
+      };
+    }
+    // Phrasing-drift fallback: catch other future <ide_*> tags so they
+    // still surface as a chip rather than getting merged into the prose
+    // textarea (which would look like raw XML to the user).
+    const tagOnly = /^\s*<(ide_[a-z_]+)\b/.exec(text);
+    if (tagOnly) {
+      return { kind: tagOnly[1], label: '(ref)', subLabel: null };
+    }
+    return null;
+  }
+
+  function basenameFromPath(p) {
+    if (!p) return '';
+    const m = String(p).match(/[^\\/]+$/);
+    return m ? m[0] : String(p);
+  }
+
+  // Parse a saved IDE-attached text block into a selection-shaped object
+  // that `session.send(text, attachments, includeSelection)` can rebuild
+  // into the same `<ide_*>` text via `zB1`. Differs from
+  // parseIdeRefText (which keeps only chip-display fields) by capturing
+  // the FULL filePath and selectedText, so on rerun the resulting
+  // model-visible content is byte-equivalent to the saved record.
+  //
+  // Format reference (verbatim from host bundle index.js zB1):
+  //   <ide_selection>The user selected the lines N to M from PATH: TEXT
+  //     This may or may not be related to the current task.</ide_selection>
+  //   <ide_opened_file>The user opened the file PATH in the IDE.
+  //     This may or may not be related to the current task.</ide_opened_file>
+  function parseIdeRefForSend(text) {
+    if (typeof text !== 'string') return null;
+    const sel = /^\s*<ide_selection>The user selected the lines (\d+) to (\d+) from ([\s\S]+?): ([\s\S]*?) This may or may not be related to the current task\.\s*<\/ide_selection>\s*$/.exec(text);
+    if (sel) {
+      return {
+        kind: 'ide_selection',
+        filePath: sel[3],
+        selectedText: sel[4],
+        startLine: parseInt(sel[1], 10),
+        endLine: parseInt(sel[2], 10),
+      };
+    }
+    const open = /^\s*<ide_opened_file>The user opened the file ([\s\S]+?) in the IDE\.\s*This may or may not be related to the current task\.\s*<\/ide_opened_file>\s*$/.exec(text);
+    if (open) {
+      return {
+        kind: 'ide_opened_file',
+        filePath: open[1],
+        selectedText: '',
+        startLine: 0,
+        endLine: 0,
+      };
+    }
+    return null;
+  }
+
+  // Walk a user record's content and pull out the first `<ide_*>` ref.
+  // Used by rerun to pre-poke `session.selection.value` so the host's
+  // own send pipeline rebuilds the exact ref text the saved record had.
+  // At most one `<ide_*>` per user message in practice (zB1 only emits
+  // one) so first-hit is correct.
+  function extractSavedIdeRef(record) {
+    const content = transcriptContent(record);
+    if (!Array.isArray(content)) return null;
+    for (const item of content) {
+      const block = unwrapTranscriptContentBlock(item);
+      if (!block || block.type !== 'text') continue;
+      const ref = parseIdeRefForSend(block.text);
+      if (ref) return ref;
+    }
+    return null;
+  }
+
+  // Convert a saved `{type:'image', source:{type:'base64', media_type, data}}`
+  // block back into a composer-shaped attachment `{file: File, dataUrl}`,
+  // which is what `session.send`'s second arg expects (see host bundle
+  // `vx`/`zB1`). Returns null for non-base64 sources we can't replay
+  // (e.g. URL-source images, which Anthropic doesn't accept anyway).
+  //
+  // The filename is synthesized from media_type since the saved block
+  // carries no filename. The host's downstream code (zB1) reads only
+  // dataUrl + file.name + file.type for image classification.
+  function imageBlockToAttachment(block) {
+    if (!block || block.type !== 'image' || !block.source) return null;
+    const src = block.source;
+    if (src.type !== 'base64' || typeof src.data !== 'string' ||
+        typeof src.media_type !== 'string') return null;
+    let bytes;
+    try {
+      const bin = atob(src.data);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch (_) { return null; }
+    const ext = (src.media_type.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '') || 'bin';
+    const name = `image.${ext}`;
+    let file;
+    try {
+      file = new File([bytes], name, { type: src.media_type });
+    } catch (_) { return null; }
+    const dataUrl = `data:${src.media_type};base64,${src.data}`;
+    return { file, dataUrl };
+  }
+
+  // Build the full rerun payload (prose, attachments, savedIdeRef) from
+  // a saved user record. Used by rerunFromUser. Mirrors the data model
+  // the chip strip + textarea show during edit, but routed through the
+  // host-public types `session.send` accepts.
+  function buildRerunPayloadFromRecord(record) {
+    const classified = classifyUserRecordBlocks(record);
+    const prose = classified.proseText || '';
+    const attachments = [];
+    const content = transcriptContent(record);
+    if (Array.isArray(content)) {
+      for (const item of content) {
+        const block = unwrapTranscriptContentBlock(item);
+        if (!block || block.type !== 'image') continue;
+        const att = imageBlockToAttachment(block);
+        if (att) attachments.push(att);
+      }
+    }
+    const savedIdeRef = extractSavedIdeRef(record);
+    return { prose, attachments, savedIdeRef };
+  }
+
+  function transcriptText(record) {
+    const content = transcriptContent(record);
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    return content
+      .map(unwrapTranscriptContentBlock)
+      .filter(block => block && block.type === 'text' && typeof block.text === 'string')
+      .map(block => block.text)
+      .join('\n');
+  }
+
+  function transcriptHasText(record) {
+    const content = transcriptContent(record);
+    if (typeof content === 'string') return true;
+    return Array.isArray(content) && content.some(block =>
+      (block = unwrapTranscriptContentBlock(block)) &&
+      block && block.type === 'text' && typeof block.text === 'string'
+    );
+  }
+
+  function transcriptHasToolResult(record) {
+    const content = transcriptContent(record);
+    return Array.isArray(content) && content.some(block => {
+      block = unwrapTranscriptContentBlock(block);
+      return block && block.type === 'tool_result';
+    });
+  }
+
+  // Detect a compact-summary user record. The Claude Code CLI persists
+  // these to JSONL with `isCompactSummary:true` + `isVisibleInTranscriptOnly:
+  // true` flags, but the host's `UT()` wrapper drops everything except
+  // `isSynthetic` when building Iz instances — so by the time the record
+  // is in `messages.value` we can't read those flags. Fingerprint
+  // instead by the literal CLI summary header string ("This session is
+  // being continued from a previous conversation that ran out of
+  // context."), which is the hardcoded compact-time prefix in the CLI
+  // and matched 100% of the compact-summary records across 73 local
+  // sessions probed.
+  //
+  // Why this matters: these records are not editable in any meaningful
+  // sense. Mutating them via the local edit/rerun path would leave the
+  // model with a synthesized "user said" turn whose content the user
+  // never actually typed, and which the CLI's own compact bookkeeping
+  // can't reconcile.
+  const COMPACT_SUMMARY_PREFIX_RE =
+    /^This session is being continued from a previous conversation that ran out of context\./;
+
+  function isCompactSummaryRecord(record) {
+    if (!record || record.type !== 'user') return false;
+    const content = transcriptContent(record);
+    let firstText = null;
+    if (typeof content === 'string') {
+      firstText = content;
+    } else if (Array.isArray(content)) {
+      for (const item of content) {
+        const block = unwrapTranscriptContentBlock(item);
+        if (block && block.type === 'text' && typeof block.text === 'string') {
+          firstText = block.text;
+          break;
+        }
+      }
+    }
+    if (typeof firstText !== 'string') return false;
+    return COMPACT_SUMMARY_PREFIX_RE.test(firstText);
+  }
+
+  function isTranscriptRecord(value) {
+    const type = String(value && value.type || '');
+    const hasHostIdentity =
+      typeof value?.uuid === 'string' ||
+      (type === 'assistant' && typeof value?.betaMessageId === 'string');
+    return !!(
+      value &&
+      typeof value === 'object' &&
+      hasHostIdentity &&
+      /^(user|assistant|system|progress|attachment)$/.test(type) &&
+      ('content' in value || 'message' in value)
+    );
+  }
+
+  function findTranscriptRecordInValue(value, depth, seen) {
+    if (!value || typeof value !== 'object' || depth < 0) return null;
+    if (isTranscriptRecord(value)) return value;
+    if (value.nodeType || value.window === value) return null;
+    if (seen.has(value)) return null;
+    seen.add(value);
+
+    const preferred = [
+      'message', 'timelineMessage', 'entry', 'item', 'record', 'msg',
+      'content', 'current', 'value',
+    ];
+    for (const key of preferred) {
+      const hit = findTranscriptRecordInValue(value[key], depth - 1, seen);
+      if (hit) return hit;
+    }
+
+    let scanned = 0;
+    for (const key of Object.keys(value)) {
+      if (preferred.includes(key)) continue;
+      if (++scanned > 40) break;
+      const v = value[key];
+      if (!v || typeof v !== 'object') continue;
+      const hit = findTranscriptRecordInValue(v, depth - 1, seen);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  function transcriptRecordForElement(el) {
+    let f = reactFiberForElement(el);
+    for (let i = 0; i < 50 && f; i++) {
+      const hit = findTranscriptRecordInValue(f.memoizedProps, 4, new WeakSet());
+      if (hit) return hit;
+      f = f.return;
+    }
+    return null;
+  }
+
+  // ============================================================
+  // Active session-id resolution — the only identity field that
+  // matters for transcript mutations.
+  // ============================================================
+  //
+  // Decompiling Claude Code 2.1.118 webview/index.js:
+  //
+  //   class Jn {                      // connection class
+  //     activeSessionId = L0(void 0); // Preact signal
+  //     sessionStates  = L0([]);      // Preact signal
+  //     ...
+  //   }
+  //
+  //   case "session_states_update":
+  //     this.sessionStates.value = $.request.sessions;
+  //     this.activeSessionId.value = $.request.activeSessionId;
+  //
+  // The extension host pushes the authoritative active-session id onto
+  // every webview via this message, so reading `connection.activeSessionId
+  // .value` gives us the canonical identity for the current panel — no
+  // mtime guessing, correct across multi-window / multi-panel / sidebar-
+  // vs-editor scenarios.
+  //
+  // Locating the connection instance: it lives in React's state tree
+  // (props/state/contextDependencies) somewhere up the fiber chain. We
+  // fingerprint by demanding both `activeSessionId` AND `sessionStates`
+  // are present and signal-like (have a `value` accessor) — the pair is
+  // unique to `Jn` in this bundle, so false positives are extremely
+  // unlikely.
+  //
+  // Cache the located instance globally; React keeps it stable across
+  // renders. If the cache stales (e.g. webview rehydrates), we re-find.
+  let cachedConnection = null;
+
+  function isConnectionLike(obj) {
+    if (!obj || typeof obj !== 'object') return false;
+    const a = obj.activeSessionId;
+    if (!a || typeof a !== 'object' || !('value' in a)) return false;
+    const s = obj.sessionStates;
+    if (!s || typeof s !== 'object' || !('value' in s)) return false;
+    return true;
+  }
+
+  function findConnectionInValue(value, depth, seen) {
+    if (!value || typeof value !== 'object' || depth < 0) return null;
+    if (isConnectionLike(value)) return value;
+    if (value.nodeType || value.window === value) return null;
+    if (seen.has(value)) return null;
+    seen.add(value);
+    const preferred = ['comms', 'connection', 'value', 'current', 'context'];
+    for (const key of preferred) {
+      const v = value[key];
+      if (!v || typeof v !== 'object') continue;
+      const hit = findConnectionInValue(v, depth - 1, seen);
+      if (hit) return hit;
+    }
+    let scanned = 0;
+    for (const key of Object.keys(value)) {
+      if (preferred.includes(key)) continue;
+      if (++scanned > 25) break;
+      const v = value[key];
+      if (!v || typeof v !== 'object') continue;
+      const hit = findConnectionInValue(v, depth - 1, seen);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  function locateConnection() {
+    if (cachedConnection && isConnectionLike(cachedConnection)) return cachedConnection;
+    // Walk up from any anchor that has a fiber (the body's first child
+    // typically does once React has mounted). Try a few anchors so we
+    // don't fail just because one element happens to be portal-detached.
+    const anchors = [
+      document.querySelector('[class*="root_"]'),
+      document.querySelector('[class*="messagesContainer_"]'),
+      document.querySelector('[class*="userMessage_"]'),
+      document.querySelector('[class*="inputContainer_"]'),
+      document.body && document.body.firstElementChild,
+      document.body,
+    ];
+    for (const anchor of anchors) {
+      if (!anchor) continue;
+      let f = reactFiberForElement(anchor);
+      for (let i = 0; i < 120 && f; i++) {
+        let conn = findConnectionInValue(f.memoizedProps, 6, new WeakSet());
+        if (!conn) conn = findConnectionInValue(f.stateNode, 6, new WeakSet());
+        if (!conn) conn = findConnectionInValue(f.memoizedState, 6, new WeakSet());
+        if (conn) {
+          cachedConnection = conn;
+          return conn;
+        }
+        f = f.return;
+      }
+    }
+    return null;
+  }
+
+  function getActiveSessionId() {
+    const conn = locateConnection();
+    if (!conn) return null;
+    try {
+      const v = conn.activeSessionId.value;
+      return typeof v === 'string' && v ? v : null;
+    } catch (_) { return null; }
+  }
+
+  // ============================================================
+  // Sessions manager (`Un` in the bundle) — needed so we can
+  // gracefully re-hydrate the current session after a JSONL
+  // mutation, without `window.location.reload()` (which blanks the
+  // panel because VS Code webviews can only `acquireVsCodeApi()`
+  // once per lifecycle).
+  //
+  // Decompiled flow we exploit:
+  //
+  //   class Un {
+  //     sessions = L0([]);             // signal: SessionState[]
+  //     activeSession = L0(undefined); // signal: current SessionState
+  //
+  //     async activateSessionFromServer(id, prompt) {
+  //       // already-in-list path: just switches activeSession
+  //       const found = this.sessions.value.find(s => s.sessionId.value === id);
+  //       if (found) { this.activeSession.value = found; return true; }
+  //       // not-in-list path: nX.fromServer(...) → new SessionState
+  //       const meta = (await getConnection().listSessions()).sessions.find(s => s.id === id);
+  //       const G = nX.fromServer(meta, ...);
+  //       this.sessions.value = [G, ...this.sessions.value];
+  //       this.activeSession.value = G;
+  //       return true;
+  //     }
+  //   }
+  //
+  // We force the not-in-list path by removing the current session
+  // from `sessions.value` first. After activate, we manually call
+  // `loadFromServer()` on the new SessionState — that walks the
+  // jsonl through `s$()` (filesystem read, no in-memory cache) and
+  // its tail invokes `launchClaude()` to spawn a fresh Claude CLI
+  // process in resume mode. The new CLI reads the freshly-edited
+  // JSONL, so subsequent user input addresses the correct context.
+  //
+  // The old Claude CLI for the previous channelId is interrupted
+  // first; host-side process cleanup is the host's responsibility
+  // once the channel is unreferenced (matches what the official
+  // fork flow leaves behind too).
+  function isSessionsManagerLike(obj) {
+    if (!obj || typeof obj !== 'object') return false;
+    if (typeof obj.activateSessionFromServer !== 'function') return false;
+    const ses = obj.sessions;
+    if (!ses || typeof ses !== 'object' || !('value' in ses)) return false;
+    const act = obj.activeSession;
+    if (!act || typeof act !== 'object' || !('value' in act)) return false;
+    return true;
+  }
+
+  let cachedSessionsManager = null;
+
+  function findSessionsManagerInValue(value, depth, seen) {
+    if (!value || typeof value !== 'object' || depth < 0) return null;
+    if (isSessionsManagerLike(value)) return value;
+    if (value.nodeType || value.window === value) return null;
+    if (seen.has(value)) return null;
+    seen.add(value);
+    const preferred = ['sessions', 'context', 'value', 'current'];
+    for (const key of preferred) {
+      const v = value[key];
+      if (!v || typeof v !== 'object') continue;
+      const hit = findSessionsManagerInValue(v, depth - 1, seen);
+      if (hit) return hit;
+    }
+    let scanned = 0;
+    for (const key of Object.keys(value)) {
+      if (preferred.includes(key)) continue;
+      if (++scanned > 25) break;
+      const v = value[key];
+      if (!v || typeof v !== 'object') continue;
+      const hit = findSessionsManagerInValue(v, depth - 1, seen);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  function locateSessionsManager() {
+    if (cachedSessionsManager && isSessionsManagerLike(cachedSessionsManager))
+      return cachedSessionsManager;
+    const anchors = [
+      document.querySelector('[class*="root_"]'),
+      document.querySelector('[class*="messagesContainer_"]'),
+      document.querySelector('[class*="userMessage_"]'),
+      document.querySelector('[class*="inputContainer_"]'),
+      document.body && document.body.firstElementChild,
+      document.body,
+    ];
+    for (const anchor of anchors) {
+      if (!anchor) continue;
+      let f = reactFiberForElement(anchor);
+      for (let i = 0; i < 120 && f; i++) {
+        let mgr = findSessionsManagerInValue(f.memoizedProps, 6, new WeakSet());
+        if (!mgr) mgr = findSessionsManagerInValue(f.stateNode, 6, new WeakSet());
+        if (!mgr) mgr = findSessionsManagerInValue(f.memoizedState, 6, new WeakSet());
+        if (mgr) {
+          cachedSessionsManager = mgr;
+          return mgr;
+        }
+        f = f.return;
+      }
+    }
+    return null;
+  }
+
+  // ============================================================
+  // Active SessionState (`nX` instance) — needed for in-place
+  // updates of messages.value (instant UI reflection of edits/
+  // deletes, no `Loading...` placeholder, no flicker) and for
+  // tearing down the current Claude CLI process so the next send
+  // re-spawns it from the freshly-edited JSONL.
+  //
+  // Fingerprint: a SessionState owns the methods `loadFromServer`
+  // and `launchClaude`, plus signal-like `messages` / `sessionId`
+  // and the writable field `claudeChannelId`. The combination is
+  // unique to `nX` in this bundle.
+  // ============================================================
+  function isSessionStateLike(obj) {
+    if (!obj || typeof obj !== 'object') return false;
+    if (typeof obj.loadFromServer !== 'function') return false;
+    if (typeof obj.launchClaude !== 'function') return false;
+    const m = obj.messages;
+    if (!m || typeof m !== 'object' || !('value' in m)) return false;
+    const s = obj.sessionId;
+    if (!s || typeof s !== 'object' || !('value' in s)) return false;
+    if (!('claudeChannelId' in obj)) return false;
+    return true;
+  }
+
+  function findSessionStateInValue(value, depth, seen) {
+    if (!value || typeof value !== 'object' || depth < 0) return null;
+    if (isSessionStateLike(value)) return value;
+    if (value.nodeType || value.window === value) return null;
+    if (seen.has(value)) return null;
+    seen.add(value);
+    const preferred = ['session', 'activeSession', 'value', 'current', 'context'];
+    for (const key of preferred) {
+      const v = value[key];
+      if (!v || typeof v !== 'object') continue;
+      const hit = findSessionStateInValue(v, depth - 1, seen);
+      if (hit) return hit;
+    }
+    let scanned = 0;
+    for (const key of Object.keys(value)) {
+      if (preferred.includes(key)) continue;
+      if (++scanned > 25) break;
+      const v = value[key];
+      if (!v || typeof v !== 'object') continue;
+      const hit = findSessionStateInValue(v, depth - 1, seen);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  function locateActiveSessionState() {
+    // Try sessions manager's activeSession.value first — this is the
+    // canonical pointer the host itself maintains.
+    const mgr = locateSessionsManager();
+    if (mgr) {
+      try {
+        const cand = mgr.activeSession && mgr.activeSession.value;
+        if (cand && isSessionStateLike(cand)) return cand;
+      } catch (_) {}
+    }
+    // Fallback: fiber pierce from message-region anchors.
+    const anchors = [
+      document.querySelector('[class*="messagesContainer_"]'),
+      document.querySelector('[class*="userMessage_"]'),
+      document.querySelector('[class*="root_"]'),
+      document.body && document.body.firstElementChild,
+      document.body,
+    ];
+    for (const anchor of anchors) {
+      if (!anchor) continue;
+      let f = reactFiberForElement(anchor);
+      for (let i = 0; i < 120 && f; i++) {
+        let s = findSessionStateInValue(f.memoizedProps, 6, new WeakSet());
+        if (!s) s = findSessionStateInValue(f.stateNode, 6, new WeakSet());
+        if (!s) s = findSessionStateInValue(f.memoizedState, 6, new WeakSet());
+        if (s) return s;
+        f = f.return;
+      }
+    }
+    return null;
+  }
+
+  // ============================================================
+  // Active AppContext — owner of `forkConversation(sessionId,
+  // promptText, prevUuid)`. Fork lives on the AppState class (one
+  // level above SessionState): it needs to allocate a new session,
+  // optionally open a new tab (config.openNewInTab), then call
+  // viewSession/startNewConversationTab. We must NOT call
+  // session.forkConversation — there is no such method; the host
+  // explicitly wires fork through context, not session (verified
+  // against extension.js 2.1.120).
+  //
+  // Fingerprint: an AppContext owns `forkConversation`, plus at
+  // least one of (viewSession / startNewConversationTab), plus a
+  // `comms` field with a `connection` signal. The triple is unique
+  // to this class in the bundle.
+  // ============================================================
+  function isAppContextLike(obj) {
+    if (!obj || typeof obj !== 'object') return false;
+    if (typeof obj.forkConversation !== 'function') return false;
+    if (typeof obj.viewSession !== 'function' &&
+        typeof obj.startNewConversationTab !== 'function') return false;
+    const c = obj.comms;
+    if (!c || typeof c !== 'object') return false;
+    const conn = c.connection;
+    if (!conn || typeof conn !== 'object' || !('value' in conn)) return false;
+    return true;
+  }
+
+  function findAppContextInValue(value, depth, seen) {
+    if (!value || typeof value !== 'object' || depth < 0) return null;
+    if (isAppContextLike(value)) return value;
+    if (value.nodeType || value.window === value) return null;
+    if (seen.has(value)) return null;
+    seen.add(value);
+    const preferred = ['context', 'app', 'appContext', 'value', 'current'];
+    for (const key of preferred) {
+      const v = value[key];
+      if (!v || typeof v !== 'object') continue;
+      const hit = findAppContextInValue(v, depth - 1, seen);
+      if (hit) return hit;
+    }
+    let scanned = 0;
+    for (const key of Object.keys(value)) {
+      if (preferred.includes(key)) continue;
+      if (++scanned > 25) break;
+      const v = value[key];
+      if (!v || typeof v !== 'object') continue;
+      const hit = findAppContextInValue(v, depth - 1, seen);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  let cachedAppContext = null;
+  function locateActiveAppContext() {
+    if (cachedAppContext && isAppContextLike(cachedAppContext)) {
+      return cachedAppContext;
+    }
+    const anchors = [
+      document.querySelector('[class*="root_"]'),
+      document.querySelector('[class*="messagesContainer_"]'),
+      document.querySelector('[class*="userMessage_"]'),
+      document.querySelector('[class*="inputContainer_"]'),
+      document.body && document.body.firstElementChild,
+      document.body,
+    ];
+    for (const anchor of anchors) {
+      if (!anchor) continue;
+      let f = reactFiberForElement(anchor);
+      for (let i = 0; i < 120 && f; i++) {
+        let ctx = findAppContextInValue(f.memoizedProps, 6, new WeakSet());
+        if (!ctx) ctx = findAppContextInValue(f.stateNode, 6, new WeakSet());
+        if (!ctx) ctx = findAppContextInValue(f.memoizedState, 6, new WeakSet());
+        if (ctx) {
+          cachedAppContext = ctx;
+          return ctx;
+        }
+        f = f.return;
+      }
+    }
+    return null;
+  }
+
+  // Look up the *current* record by uuid from active SessionState's
+  // messages.value. Edits replace the Ez instance in the array (uuid
+  // stable, identity changes), so any callback that captured the
+  // original record at decoration time will hold a stale reference
+  // after the user edits and clicks rerun/re-edit/copy. Always resolve
+  // through this helper at click time to read current text.
+  function liveTranscriptRecord(uuid, fallback) {
+    const wantedUuid =
+      (typeof uuid === 'string' && uuid) ||
+      (typeof fallback?.uuid === 'string' && fallback.uuid) ||
+      '';
+    const wantedBeta =
+      (typeof fallback?.betaMessageId === 'string' && fallback.betaMessageId) ||
+      '';
+    if (!wantedUuid && !wantedBeta) return fallback;
+    try {
+      const s = locateActiveSessionState();
+      if (s && s.messages && Array.isArray(s.messages.value)) {
+        let hit = null;
+        if (fallback) {
+          const identityIdx = s.messages.value.indexOf(fallback);
+          if (identityIdx >= 0) hit = s.messages.value[identityIdx];
+        }
+        if (!hit && wantedUuid) {
+          for (let i = s.messages.value.length - 1; i >= 0; i--) {
+            const m = s.messages.value[i];
+            if (m && m.uuid === wantedUuid) {
+              hit = m;
+              break;
+            }
+          }
+        }
+        if (!hit && wantedBeta) {
+          for (let i = s.messages.value.length - 1; i >= 0; i--) {
+            const m = s.messages.value[i];
+            if (m && m.betaMessageId === wantedBeta) {
+              hit = m;
+              break;
+            }
+          }
+        }
+        if (hit) return hit;
+      }
+    } catch (_) {}
+    return fallback;
+  }
+
+  // Build an edited copy of a host message object.
+  //
+  // SHAPE NOTE (reverse-engineered from `webview/index.js` 2.1.118):
+  // `messages.value` does not hold raw JSONL records. Each entry is an
+  // `Ez` instance with the flat shape
+  //   { type, uuid, betaMessageId, content, timestamp,
+  //     parentToolUseId, isSynthetic, compactMetadata }
+  // and `content` is a `SY[]` array. Each `SY` wraps one JSONL block:
+  //   { content: { type:'text', text }, partial, hash, lastModifiedTime,
+  //     toolResultSignal, progressSignal, ... }
+  // React renders blocks via `J.content.map(B => createElement(yW,
+  // {key: B.key, ...}))`, where `B.key === B.hash + B.lastModifiedTime`.
+  //
+  // To make the webview re-render after an edit we must:
+  //   1. Build a brand-new `SY` (new hash → new key → React unmounts the
+  //      old block and mounts a new one with the new text).
+  //   2. Build a brand-new `Ez` (new instance → React.memo on the row
+  //      sees a different prop reference and re-renders this message).
+  //   3. Hand back the new `Ez` so the caller can place it into a fresh
+  //      `messages.value` array (signal subscribers fire, useMemo deps
+  //      invalidate).
+  // We pull the constructors off the existing instances, so we don't
+  // need to anchor to the minified class names. Failure path: return
+  // the original message — caller's array slice is still a new array
+  // reference, so the rest of the reflect pipeline (interrupt + clear
+  // channelId) still runs.
+  function makeEditedMessage(message, newText) {
+    if (!message || typeof message !== 'object') return message;
+    if (!Array.isArray(message.content) || message.content.length === 0) return message;
+
+    let textIdx = -1;
+    for (let i = 0; i < message.content.length; i++) {
+      const sy = message.content[i];
+      const c = sy && sy.content;
+      if (c && c.type === 'text' && typeof c.text === 'string') {
+        textIdx = i;
+        break;
+      }
+    }
+    if (textIdx < 0) return message;
+
+    const oldSy = message.content[textIdx];
+    const SyCtor = oldSy && oldSy.constructor;
+    if (typeof SyCtor !== 'function') return message;
+    let newSy;
+    try {
+      newSy = new SyCtor({ ...oldSy.content, text: newText }, !!oldSy.partial);
+    } catch (_) { return message; }
+
+    const newContent = message.content.slice();
+    newContent[textIdx] = newSy;
+
+    const EzCtor = message.constructor;
+    if (typeof EzCtor !== 'function') return message;
+    try {
+      return new EzCtor(message.type, newContent, {
+        uuid: message.uuid,
+        betaMessageId: message.betaMessageId,
+        timestamp: message.timestamp,
+        parentToolUseId: message.parentToolUseId,
+        isSynthetic: message.isSynthetic,
+        compactMetadata: message.compactMetadata,
+      });
+    } catch (_) { return message; }
+  }
+
+  // Block-aware companion to makeEditedMessage. The save path for rich
+  // user edits sends a `blocks` spec (kept-by-index + new text + new
+  // images); reflect needs to rebuild the Ez accordingly.
+  //
+  // Why reuse the original SY for `kind:'keep'` (vs constructing a
+  // fresh one with the same JSONL block): SY carries `hash` and
+  // `lastModifiedTime`, and React keys block components by
+  // `B.hash + B.lastModifiedTime`. Reusing the same SY → same key →
+  // React doesn't unmount that block. For images this matters: a fresh
+  // SY with the same data URL would still cause a React unmount/mount
+  // pair (the block's own React component re-creation), which can
+  // briefly blank the image while the browser re-decodes the base64.
+  // Keep-by-reference avoids the flicker entirely.
+  function makeEditedMessageBlocks(message, blocksSpec) {
+    if (!message || typeof message !== 'object') return message;
+    if (!Array.isArray(message.content)) return message;
+    if (!Array.isArray(blocksSpec) || blocksSpec.length === 0) return message;
+
+    const oldContent = message.content;
+    let SyCtor = null;
+    for (const sy of oldContent) {
+      if (sy && typeof sy.constructor === 'function') {
+        SyCtor = sy.constructor;
+        break;
+      }
+    }
+    if (!SyCtor) return message;
+
+    const newContent = [];
+    for (const spec of blocksSpec) {
+      if (spec.kind === 'keep' &&
+          Number.isInteger(spec.index) &&
+          spec.index >= 0 &&
+          spec.index < oldContent.length) {
+        newContent.push(oldContent[spec.index]);
+      } else if (spec.kind === 'text' && typeof spec.text === 'string') {
+        try { newContent.push(new SyCtor({ type: 'text', text: spec.text }, false)); }
+        catch (_) { /* skip on shape drift */ }
+      } else if (spec.kind === 'image' &&
+                 spec.source && typeof spec.source === 'object' &&
+                 spec.source.type === 'base64' &&
+                 typeof spec.source.data === 'string' &&
+                 typeof spec.source.media_type === 'string') {
+        try { newContent.push(new SyCtor({ type: 'image', source: spec.source }, false)); }
+        catch (_) { /* skip on shape drift */ }
+      }
+    }
+    if (newContent.length === 0) return message;
+
+    const EzCtor = message.constructor;
+    if (typeof EzCtor !== 'function') return message;
+    try {
+      return new EzCtor(message.type, newContent, {
+        uuid: message.uuid,
+        betaMessageId: message.betaMessageId,
+        timestamp: message.timestamp,
+        parentToolUseId: message.parentToolUseId,
+        isSynthetic: message.isSynthetic,
+        compactMetadata: message.compactMetadata,
+      });
+    } catch (_) { return message; }
+  }
+
+  // Identity payload for transcript mutations. `sessionId` comes from the
+  // connection signal (authoritative). `cwd` is best-effort off the record
+  // (each JSONL entry carries it natively); host doesn't need it because
+  // it can scan project dirs by sessionId, but sending when available lets
+  // host short-circuit the scan.
+  function transcriptRecordIdentity(record) {
+    const sessionId = getActiveSessionId();
+    if (!sessionId) return null;
+    const cwd =
+      (record && (record.cwd || record.message?.cwd || record.entry?.cwd || record.content?.cwd)) ||
+      null;
+    return { sessionId, cwd };
+  }
+
+  // Static lookup of which kinds get a streaming-disabled variant SVG.
+  // - copy / more: live during streaming (copy never depends on
+  //   transcript state; the more dropdown only ever exposes copy
+  //   variants right now).
+  // - rerun: disabled visuals are colour + opacity only (no slash);
+  //   we still want the busy-state machinery to flip its data attr so
+  //   the click handler swallows, but no innerHTML swap.
+  // - edit: traditional slash overlay so the disabled state is
+  //   unmistakable next to a live rerun/copy in the same row.
+  const DISABLED_ICON_BY_KIND = {
+    edit: EDIT_ICON_DISABLED_SVG,
+  };
+  // Kinds that should still flip data-incipit-disabled even though they
+  // have no swap-icon — CSS owns the visual delta. Rerun + fork share
+  // the same colour-only treatment (single primitive verbs, not
+  // slash-able like edit/delete).
+  const COLOR_ONLY_DISABLED_KINDS = new Set(['rerun', 'fork']);
+
+  function makeTranscriptActionButton(kind, title, iconSvg, handler) {
+    const btn = document.createElement('button');
+    btn.className = `claude-user-copy-btn incipit-transcript-action-btn incipit-transcript-action-${kind}`;
+    btn.type = 'button';
+    btn.title = title;
+    btn.innerHTML = iconSvg;
+    btn.dataset.incipitActionKind = kind;
+    // Stash live + disabled assets on the node so reconcile flips can
+    // run without needing to touch the SVG dictionaries again.
+    btn._incipitLiveIcon = iconSvg;
+    btn._incipitDisabledIcon = DISABLED_ICON_BY_KIND[kind] || null;
+    btn._incipitLiveTitle = title;
+    btn._incipitColorOnlyDisabled = COLOR_ONLY_DISABLED_KINDS.has(kind);
+    btn._incipitBlocksWhileBusy = !!(btn._incipitDisabledIcon || btn._incipitColorOnlyDisabled);
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      // Streaming gate: any button currently flagged disabled swallows
+      // the click silently. No toast (would compete with the input box
+      // that's already locked while streaming).
+      if (btn.dataset.incipitDisabled === '1') return;
+      if (btn._incipitBlocksWhileBusy) {
+        let busy = false;
+        try { busy = conversationIsBusy(); } catch (_) { busy = false; }
+        if (busy) {
+          applyButtonBusyState(btn, true);
+          return;
+        }
+      }
+      try {
+        const result = handler(btn, e);
+        if (result && typeof result.then === 'function') {
+          result.catch(error => {
+            warn('transcript action failed:', kind, error);
+            showTranscriptToast('Action failed', 'error');
+          });
+        }
+      } catch (error) {
+        warn('transcript action failed:', kind, error);
+        showTranscriptToast('Action failed', 'error');
+      }
+    });
+    return btn;
+  }
+
+  // Idempotent state-flip on a single button. Bails out when target
+  // state matches current — this is the hot-path during streaming so
+  // the no-op branch must stay free of DOM writes.
+  function applyButtonBusyState(btn, busy) {
+    if (!btn) return;
+    // Buttons that don't participate at all in the streaming gate (copy
+    // / more — both safe during streaming).
+    if (!btn._incipitDisabledIcon && !btn._incipitColorOnlyDisabled) return;
+    const wantDisabled = !!busy;
+    const isDisabled = btn.dataset.incipitDisabled === '1';
+    if (wantDisabled === isDisabled) return;
+    if (wantDisabled) {
+      btn.dataset.incipitDisabled = '1';
+      // Slash-overlay kinds (edit) swap the SVG; colour-only kinds
+      // (rerun) leave the SVG alone and let CSS handle the visual via
+      // the data attr selector.
+      if (btn._incipitDisabledIcon) btn.innerHTML = btn._incipitDisabledIcon;
+      // Drop the title attr so hover yields no tooltip (per UX brief).
+      // Keep aria-disabled so a11y still surfaces the state.
+      btn.removeAttribute('title');
+      btn.setAttribute('aria-disabled', 'true');
+    } else {
+      delete btn.dataset.incipitDisabled;
+      if (btn._incipitDisabledIcon) btn.innerHTML = btn._incipitLiveIcon;
+      if (btn._incipitLiveTitle) btn.setAttribute('title', btn._incipitLiveTitle);
+      btn.removeAttribute('aria-disabled');
+    }
+  }
+
+  // Sweep all currently-mounted action buttons, snap them to the busy
+  // state. Cheap because applyButtonBusyState early-returns on no-op.
+  // Inline-edit save buttons go through their own busy-flip helper —
+  // the same observer/sweep pulse drives both, so the inline editor
+  // stays consistent with the icon row even mid-edit.
+  function sweepStreamingDisableState() {
+    const busy = conversationIsBusy();
+    const icons = document.querySelectorAll('.incipit-transcript-action-btn');
+    for (const btn of icons) applyButtonBusyState(btn, busy);
+    const saves = document.querySelectorAll('.incipit-inline-edit-save');
+    for (const btn of saves) applyInlineSaveBusyState(btn, busy);
+  }
+
+  const TRANSCRIPT_ACTION_QUIET_MS = 360;
+  const TRANSCRIPT_ACTION_BUSY_POLL_MS = 240;
+  let lastTranscriptMutationAt = 0;
+  let transcriptActionSettleTimer = null;
+  let transcriptActionBurstToken = 0;
+
+  function nowMs() {
+    return (typeof performance !== 'undefined' && performance.now)
+      ? performance.now()
+      : Date.now();
+  }
+
+  function noteTranscriptActionMutation() {
+    lastTranscriptMutationAt = nowMs();
+    scheduleTranscriptActionSettleScan();
+  }
+
+  function scheduleTranscriptActionSettleScan(delay) {
+    const wait = typeof delay === 'number' ? Math.max(0, delay) : TRANSCRIPT_ACTION_QUIET_MS;
+    if (transcriptActionSettleTimer) clearTimeout(transcriptActionSettleTimer);
+    transcriptActionSettleTimer = setTimeout(runTranscriptActionSettleScan, wait);
+  }
+
+  function runTranscriptActionSettleScan() {
+    transcriptActionSettleTimer = null;
+
+    if (conversationIsBusy()) {
+      scheduleTranscriptActionSettleScan(TRANSCRIPT_ACTION_BUSY_POLL_MS);
+      return;
+    }
+
+    const quietFor = nowMs() - lastTranscriptMutationAt;
+    if (quietFor < TRANSCRIPT_ACTION_QUIET_MS) {
+      scheduleTranscriptActionSettleScan(TRANSCRIPT_ACTION_QUIET_MS - quietFor);
+      return;
+    }
+
+    runTranscriptActionScanBurst();
+  }
+
+  function runTranscriptActionScanBurst() {
+    const token = ++transcriptActionBurstToken;
+    let frames = 0;
+
+    const scanOnce = () => {
+      try { scanAssistantTranscriptActions(document.body); }
+      catch (e) { warn('assistant actions failed:', e); }
+    };
+
+    // 3 RAF ticks (≈48 ms wall) covers the common case where React
+    // commits the final assistant markdown root one frame after the
+    // settle scan fires. The 650 ms / 1500 ms setTimeout fallbacks
+    // catch late-mounting roots and unmount-then-remount flips. The
+    // earlier 14-frame burst was a holdover from when reconcile
+    // re-resolved fiber + isLastAssistantOfTurn even for already-
+    // decorated rows; that fast-path now exists, so the burst no
+    // longer needs to re-amortise its per-frame cost so aggressively.
+    const MAX_FRAMES = 3;
+
+    const tick = () => {
+      if (token !== transcriptActionBurstToken) return;
+      if (conversationIsBusy()) {
+        scheduleTranscriptActionSettleScan(TRANSCRIPT_ACTION_BUSY_POLL_MS);
+        return;
+      }
+      const quietFor = nowMs() - lastTranscriptMutationAt;
+      if (quietFor < TRANSCRIPT_ACTION_QUIET_MS) {
+        scheduleTranscriptActionSettleScan(TRANSCRIPT_ACTION_QUIET_MS - quietFor);
+        return;
+      }
+      scanOnce();
+      if (++frames < MAX_FRAMES) requestAnimationFrame(tick);
+    };
+
+    requestAnimationFrame(tick);
+    setTimeout(() => {
+      if (token === transcriptActionBurstToken && !conversationIsBusy()) scanOnce();
+    }, 650);
+    setTimeout(() => {
+      if (token === transcriptActionBurstToken && !conversationIsBusy()) scanOnce();
+    }, 1500);
+  }
+
+  // Watch send-button state attr to trigger the transcript-action gate.
+  // Assistant/tool action rows are not minted directly from streaming
+  // mutations anymore. Those mutations only mark the transcript dirty;
+  // once the UI is idle and the message DOM has gone quiet, the settle
+  // scanner below materialises the final rows in one place.
+  // host_probe writes `data-incipit-send-state` idempotently via
+  // `ensureAttr`, so this observer only fires on actual transitions.
+  let busyStateObserverBound = false;
+  let lastBusySeen = false;
+  function setupBusyStateObserver() {
+    if (busyStateObserverBound) return;
+    busyStateObserverBound = true;
+    lastBusySeen = conversationIsBusy();
+    const cleanupDuringBusy = () => {
+      try { scanAssistantTranscriptActions(document.body); } catch (_) {}
+      try { sweepStreamingDisableState(); } catch (_) {}
+    };
+    const trigger = () => {
+      const cur = conversationIsBusy();
+      if (cur === lastBusySeen) return;  // attr changed but state didn't (send|null|stop|...)
+      lastBusySeen = cur;
+      if (cur === false) {
+        flushDeferredCodeHighlightsIfReady();
+        scheduleTranscriptActionSettleScan(0);
+      } else {
+        // Idle → busy: flip past-turn rows to disabled and remove any
+        // tail-row that slipped in during the send/stop transition.
+        // Also eagerly clear any active edit hover-preview attr so a
+        // user who happened to be hovering the pencil at the moment
+        // streaming started doesn't see the draft-bg lingering on a
+        // now-disabled icon (mouseenter early-return covers fresh
+        // hovers; this handles the hover-in-flight case).
+        document.querySelectorAll('[data-incipit-edit-hover-preview]')
+          .forEach(el => el.removeAttribute('data-incipit-edit-hover-preview'));
+        requestAnimationFrame(cleanupDuringBusy);
+      }
+    };
+    const obs = new MutationObserver(trigger);
+    obs.observe(document.body, {
+      attributes: true,
+      attributeFilter: ['data-incipit-send-state'],
+      subtree: true,
+    });
+  }
+
+  // File drag reference hint.
+  //
+  // VS Code owns the actual file-drop routing. incipit no longer intercepts
+  // drops, prevents defaults, or inserts @ mentions here; doing so needs a
+  // workbench-level bridge and that proved too invasive. This is only a
+  // localized composer hint for drag events that naturally reach the Claude
+  // webview: "hold Shift and drop here to reference the file".
+  let fileDragHintBound = false;
+  let fileDragHintClearTimer = 0;
+
+  const FILE_DRAG_HINT_TEXT = Object.freeze({
+    zh: '按住 Shift 拖放到这里引用文件',
+    en: 'Hold Shift and drop here to reference the file',
+  });
+
+  function dataTransferTypes(dt) {
+    try { return Array.from(dt && dt.types ? dt.types : []); }
+    catch (_) { return []; }
+  }
+
+  function hasFileishDrag(dt) {
+    if (!dt) return false;
+    const types = dataTransferTypes(dt).map(t => String(t).toLowerCase());
+    if (types.some(t =>
+      t === 'files' ||
+      t === 'resourceurls' ||
+      t === 'codeeditors' ||
+      t === 'codefiles' ||
+      t === 'application/vnd.code.uri-list' ||
+      t === 'text/uri-list'
+    )) return true;
+    const items = dt.items ? Array.from(dt.items) : [];
+    return items.some(item => item && item.kind === 'file');
+  }
+
+  function currentComposerElement() {
+    return document.querySelector(SEL.inputContainer);
+  }
+
+  function fileDragHintText() {
+    return FILE_DRAG_HINT_TEXT[CFG.language] || FILE_DRAG_HINT_TEXT.en;
+  }
+
+  function clearOneFileDragHint(el) {
+    if (!el || !el.removeAttribute) return;
+    el.removeAttribute('data-incipit-file-drag-hint');
+    el.removeAttribute('data-incipit-file-drag-hint-text');
+  }
+
+  function setFileDragHintState() {
+    const composer = currentComposerElement();
+    const current = document.querySelector('[data-incipit-file-drag-hint="over"]');
+    if (current && current !== composer) clearOneFileDragHint(current);
+    if (!composer) return;
+    composer.setAttribute('data-incipit-file-drag-hint', 'over');
+    composer.setAttribute('data-incipit-file-drag-hint-text', fileDragHintText());
+  }
+
+  function clearFileDragHintState() {
+    if (fileDragHintClearTimer) {
+      clearTimeout(fileDragHintClearTimer);
+      fileDragHintClearTimer = 0;
+    }
+    document.querySelectorAll('[data-incipit-file-drag-hint]').forEach(clearOneFileDragHint);
+  }
+
+  function scheduleFileDragHintClear() {
+    if (fileDragHintClearTimer) clearTimeout(fileDragHintClearTimer);
+    fileDragHintClearTimer = setTimeout(() => {
+      fileDragHintClearTimer = 0;
+      clearFileDragHintState();
+    }, 900);
+  }
+
+  function setupFileDragReferenceHint() {
+    if (fileDragHintBound) return;
+    fileDragHintBound = true;
+
+    const maybeShow = evt => {
+      const dt = evt && evt.dataTransfer;
+      if (!hasFileishDrag(dt)) return;
+      setFileDragHintState();
+      scheduleFileDragHintClear();
+    };
+
+    document.addEventListener('dragenter', maybeShow, true);
+    document.addEventListener('dragover', maybeShow, true);
+    document.addEventListener('dragleave', scheduleFileDragHintClear, true);
+    document.addEventListener('dragend', clearFileDragHintState, true);
+    document.addEventListener('drop', clearFileDragHintState, true);
+    window.addEventListener('blur', clearFileDragHintState);
+  }
+
+  function setupTranscriptMutationChannel() {
+    if (transcriptMutationListenerBound) return;
+    transcriptMutationListenerBound = true;
+    window.addEventListener('message', evt => {
+      const msg = evt && evt.data;
+      if (!msg || msg.__incipit !== true || msg.type !== 'conversation_mutation_response') return;
+      const pending = transcriptMutationPending.get(msg.requestId);
+      if (!pending) return;
+      transcriptMutationPending.delete(msg.requestId);
+      const payload = msg.payload || {};
+      if (payload.ok === false) pending.reject(new Error(payload.error || 'Transcript mutation failed'));
+      else pending.resolve(payload);
+    });
+  }
+
+  function requestTranscriptMutation(op, payload, options) {
+    const allowBusy = !!(options && options.allowBusy);
+    if (!allowBusy && conversationIsBusy()) {
+      return Promise.reject(new Error('Wait for the current reply to finish before editing local history.'));
+    }
+    setupTranscriptMutationChannel();
+    const api = getIncipitVsCodeApi();
+    if (!api || typeof api.postMessage !== 'function') {
+      return Promise.reject(new Error('Could not reach the VS Code webview channel.'));
+    }
+    const requestId = 'mut-' + (++transcriptMutationSeq).toString(36);
+    const message = {
+      __incipit: true,
+      type: 'conversation_mutation_request',
+      requestId,
+      op,
+      ...payload,
+    };
+    return new Promise((resolve, reject) => {
+      transcriptMutationPending.set(requestId, { resolve, reject });
+      try {
+        api.postMessage(message);
+      } catch (error) {
+        transcriptMutationPending.delete(requestId);
+        reject(error);
+      }
+      setTimeout(() => {
+        const pending = transcriptMutationPending.get(requestId);
+        if (!pending) return;
+        transcriptMutationPending.delete(requestId);
+        pending.reject(new Error('Local history write request timed out.'));
+      }, 12000);
+    });
+  }
+
+  const assistantUuidResolvePending = new Map();
+
+  async function ensureAssistantRecordUuid(record) {
+    if (!record || record.type !== 'assistant') return record;
+    if (recordUuid(record)) return record;
+
+    const live = liveTranscriptRecord(null, record);
+    if (live && recordUuid(live)) return live;
+
+    const betaMessageId = recordBetaMessageId(live || record);
+    if (!betaMessageId) return live || record;
+
+    const identity = transcriptRecordIdentity(live || record);
+    if (!identity) return live || record;
+
+    const key = `${identity.sessionId}:${betaMessageId}`;
+    let pending = assistantUuidResolvePending.get(key);
+    if (!pending) {
+      pending = requestTranscriptMutation('resolve_assistant_uuid', {
+        betaMessageId,
+        textTail: transcriptText(live || record).slice(-600),
+        ...identity,
+      }).then(payload => {
+        const uuid = payload && typeof payload.uuid === 'string' ? payload.uuid : '';
+        if (uuid) {
+          try { record.uuid = uuid; } catch (_) {}
+          if (live && live !== record) {
+            try { live.uuid = uuid; } catch (_) {}
+          }
+        }
+        return uuid;
+      }).finally(() => {
+        assistantUuidResolvePending.delete(key);
+      });
+      assistantUuidResolvePending.set(key, pending);
+    }
+
+    try { await pending; }
+    catch (_) { return live || record; }
+    return liveTranscriptRecord(null, live || record) || live || record;
+  }
+
+  function nodeIsRendered(node) {
+    return !!(
+      node &&
+      (node.offsetWidth || node.offsetHeight ||
+        (node.getClientRects && node.getClientRects().length))
+    );
+  }
+
+  function sendButtonDomState() {
+    const buttons = document.querySelectorAll('[data-incipit-send-button], [class*="sendButton"]');
+    let sawSend = false;
+    for (const button of buttons) {
+      if (!nodeIsRendered(button)) continue;
+      // The theme hides the host SVGs and draws replacement masks on the
+      // button. Treat the icon classes as semantic state, not rendered
+      // geometry; stale data attrs are only a fallback because React can
+      // change sendIcon -> stopIcon by mutating class on the same svg node.
+      if (button.querySelector('[class*="stopIcon"]')) return 'stop';
+      if (button.querySelector('[class*="sendIcon"]')) {
+        sawSend = true;
+        continue;
+      }
+      if (button.querySelector('[data-incipit-stop-icon]')) return 'stop';
+      if (button.querySelector('[data-incipit-send-icon]')) {
+        sawSend = true;
+        continue;
+      }
+      if (button.getAttribute('data-incipit-send-state') === 'stop') return 'stop';
+      if (button.getAttribute('data-incipit-send-state') === 'send') sawSend = true;
+    }
+    return sawSend ? 'send' : null;
+  }
+
+  function transcriptBlockIsPartial(block) {
+    if (!block || typeof block !== 'object') return false;
+    if (block.partial === true) return true;
+    const inner = block.content;
+    return !!(inner && typeof inner === 'object' && inner.partial === true);
+  }
+
+  function transcriptRecordHasPartialContent(record) {
+    const content = transcriptContent(record);
+    if (!Array.isArray(content)) return false;
+    return content.some(transcriptBlockIsPartial);
+  }
+
+  function activeSessionHasPartialTail() {
+    const session = locateActiveSessionState();
+    const messages = session && session.messages && session.messages.value;
+    if (!Array.isArray(messages) || messages.length === 0) return false;
+    let seen = 0;
+    for (let i = messages.length - 1; i >= 0 && seen < 12; i--) {
+      const m = messages[i];
+      if (!m || typeof m !== 'object') continue;
+      if (m.type === 'assistant') {
+        seen++;
+        if (transcriptRecordHasPartialContent(m)) return true;
+        continue;
+      }
+      if (m.type === 'user') {
+        if (transcriptHasToolResult(m)) {
+          seen++;
+          continue;
+        }
+        break;
+      }
+      seen++;
+    }
+    return false;
+  }
+
+  function activeSessionBusyState() {
+    const session = locateActiveSessionState();
+    const busy = session && session.busy;
+    if (busy && typeof busy === 'object' && 'value' in busy) {
+      try {
+        if (typeof busy.value === 'boolean') return busy.value;
+      } catch (_) {}
+    }
+    if (typeof busy === 'boolean') return busy;
+    return null;
+  }
+
+  function conversationIsBusy() {
+    // Claude Code's SessionState toggles this in send() and readMessages()
+    // finally/result handling. It is the canonical stream gate; footer icon
+    // shape is only a fallback for host versions where fiber lookup drifts.
+    const sessionBusy = activeSessionBusyState();
+    if (sessionBusy !== null) return sessionBusy;
+
+    const domState = sendButtonDomState();
+    if (domState === 'stop') return true;
+    // A visible send icon is authoritative once the message area has
+    // stopped changing; while mutations are fresh, prefer the partial
+    // transcript flag because it closes the send→stop transition race.
+    if (domState === 'send' && nowMs() - lastTranscriptMutationAt > 1500) return false;
+    const partialTail = activeSessionHasPartialTail();
+    if (!partialTail) return false;
+    return true;
+  }
+
+  function showTranscriptToast(text, kind = '') {
+    let toast = document.querySelector('[data-incipit-transcript-toast]');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.setAttribute('data-incipit-transcript-toast', '');
+      document.body.appendChild(toast);
+    }
+    toast.textContent = text;
+    toast.setAttribute('data-kind', kind);
+    toast.setAttribute('data-visible', '1');
+    clearTimeout(toast.__incipitTimer);
+    toast.__incipitTimer = setTimeout(() => {
+      toast.removeAttribute('data-visible');
+    }, 2600);
+  }
+
+  // After a JSONL mutation succeeds, reflect the change in the live
+  // webview state without `window.location.reload()` (which blanks
+  // VS Code webviews because `acquireVsCodeApi()` can only be called
+  // once per webview lifecycle) and without `loadFromServer()` (which
+  // flips `isLoading.value` and renders a "Loading..." placeholder
+  // mid-transition — visible flicker).
+  //
+  // Strategy:
+  //   1. Mutate `activeSession.messages.value` directly. React keys
+  //      messages by uuid, so removed rows disappear and edited rows
+  //      re-render in place — siblings are untouched.
+  //   2. Interrupt the live Claude CLI for this session and null out
+  //      `claudeChannelId`. The CLI's in-memory transcript is now
+  //      stale (it was hydrated once at spawn time and only appends
+  //      thereafter — confirmed by the fact that a window reload was
+  //      previously needed for edits to "stick"). Tearing it down
+  //      defers the spawn cost to the user's next send().
+  //   3. Next send() runs the host's standard path:
+  //        await this.launchClaude()  // sees channelId === null,
+  //                                    // spawns a fresh process in
+  //                                    // resume mode against the
+  //                                    // edited JSONL.
+  //      User-visible delay is only the spawn time on the first
+  //      token (~the same wait as opening a session for the first
+  //      time). No flicker, no loading placeholder, no reload.
+  function reflectTranscriptMutation(op, payload, newText) {
+    const session = locateActiveSessionState();
+    const conn = locateConnection();
+
+    // Step 1 — mutate messages.value to reflect the change instantly.
+    // Only edit ops reach here; truncate has its own reflect path
+    // inside `rerunFromUser` because it also needs to trigger a fresh
+    // send afterwards.
+    if (session && session.messages && Array.isArray(session.messages.value)) {
+      const current = session.messages.value;
+      let next = null;
+      if (op === 'edit_user' || op === 'edit_assistant_text') {
+        const targetUuid = payload && payload.uuid;
+        if (targetUuid && typeof newText === 'string') {
+          const idx = transcriptRecordIndex(current, { uuid: targetUuid });
+          if (idx >= 0) {
+            next = current.slice();
+            next[idx] = makeEditedMessage(current[idx], newText);
+          }
+        }
+      }
+      if (next) {
+        try { session.messages.value = next; } catch (_) {}
+      }
+    }
+
+    // Step 2 — tear down current Claude CLI; defer spawn to next send.
+    if (session) {
+      const oldChannelId = session.claudeChannelId;
+      if (oldChannelId && conn && typeof conn.interruptClaude === 'function') {
+        try { conn.interruptClaude(oldChannelId); } catch (_) {}
+      }
+      try { session.claudeChannelId = null; } catch (_) {}
+      // Also clear loadingPromise so a future loadFromServer (e.g. on
+      // session resume) actually re-runs against the new JSONL.
+      try { session.loadingPromise = undefined; } catch (_) {}
+    }
+
+    // Step 3 — only surface a toast when we couldn't locate the
+    // SessionState (rare React-shape drift). In the success path the
+    // user can see the change directly in the bubble list, so a
+    // confirmation toast is just noise that overlaps the input.
+    if (!session) {
+      showTranscriptToast('Local history updated. Refresh the window so the model sees the new content.', 'warn');
+    }
+  }
+
+  // Block-aware reflect for rich user edits. Replaces the target Ez
+  // with a block-rebuilt Ez (kept SYs preserved by reference, new
+  // text/image SYs minted) and tears down the live channel. Mirrors
+  // the channel-teardown half of reflectTranscriptMutation; the only
+  // structural difference is which Ez constructor is used.
+  function reflectUserEditBlocks(uuid, blocksSpec) {
+    const session = locateActiveSessionState();
+    const conn = locateConnection();
+    if (session && session.messages && Array.isArray(session.messages.value)) {
+      const cur = session.messages.value;
+      const idx = transcriptRecordIndex(cur, { uuid });
+      if (idx >= 0) {
+        const newEz = makeEditedMessageBlocks(cur[idx], blocksSpec);
+        if (newEz && newEz !== cur[idx]) {
+          const next = cur.slice();
+          next[idx] = newEz;
+          try { session.messages.value = next; } catch (_) {}
+        }
+      }
+    }
+    if (session) {
+      const oldChannelId = session.claudeChannelId;
+      if (oldChannelId && conn && typeof conn.interruptClaude === 'function') {
+        try { conn.interruptClaude(oldChannelId); } catch (_) {}
+      }
+      try { session.claudeChannelId = null; } catch (_) {}
+      try { session.loadingPromise = undefined; } catch (_) {}
+    }
+    if (!session) {
+      showTranscriptToast('Local history updated. Refresh the window so the model sees the new content.', 'warn');
+    }
+  }
+
+  // ---- Rerun this turn ----
+  //
+  // Anchored to a user bubble. Drops the user record + everything
+  // following it (assistant replies, tool calls, tool results) from
+  // both the JSONL and the live SessionState, then re-sends the user's
+  // text as a fresh input so Claude regenerates the turn.
+  //
+  // Why anchor on user bubbles: the truncation boundary is inherently
+  // safe — anything left in JSONL ends at a user-or-earlier boundary,
+  // so messages always start on a user role and never leave orphan
+  // tool_use blocks that would violate Anthropic's API contract.
+  //
+  // Implementation outline:
+  //   1. Send `truncate_from_user` to the host. Host walks rows by
+  //      index, drops everything from this user's *latest* row onward
+  //      (correctly handles compact-duplicated uuids — the row we
+  //      cut at is the live one), and returns a short-lived rollback
+  //      token for the exact truncated JSONL text.
+  //   2. Reflect: filter messages.value down to entries before this
+  //      user's index. React keys by uuid so siblings stay mounted.
+  //   3. Tear down the live Claude CLI channel — same as edit reflect.
+  //      Next launch is in `--resume` mode against the truncated JSONL.
+  //   4. Replay the user's text through the host's own send pipeline
+  //      via `session.send`. If send fails before any new JSONL append
+  //      is observed, ask the host to roll the exact truncated text
+  //      back to the original transcript.
+  async function rerunFromUser(record, button) {
+    if (!record || record.type !== 'user') return;
+    // Always read current Ez from messages.value — caller's closure
+    // (a button click handler bound at decoration time) holds the
+    // pre-edit instance after a save replaced it. Rerun must use the
+    // post-edit content (text *and* image chips), otherwise saving an
+    // edit then clicking rerun replays pre-edit content and the bubble
+    // appears to revert.
+    record = liveTranscriptRecord(record.uuid, record);
+    if (record.isSynthetic || transcriptHasToolResult(record)) return;
+    if (conversationIsBusy()) return;
+
+    // Build the rerun payload from the saved record's blocks. Routes
+    // through the host's own send pipeline (`session.send` →
+    // `zB1` → API content[]), so the model sees byte-equivalent content
+    // to what the bubble shows: text, image base64 blocks, and a
+    // single optional `<ide_*>` ref synthesized from the saved selection.
+    const { prose, attachments, savedIdeRef } = buildRerunPayloadFromRecord(record);
+    if (!prose && !attachments.length) {
+      showTranscriptToast('No content to rerun', 'error');
+      return;
+    }
+
+    // Preflight: prove we can replay BEFORE we mutate the JSONL.
+    // truncate_from_user is irreversible from the user's POV — if we
+    // discover the host React shape drifted (no SessionState, no
+    // session.send, no writable selection signal) only after the
+    // truncate, the conversation tail is already gone and the user
+    // is left with no replacement message. Resolve everything we
+    // need first; only then ask the host to truncate.
+    //
+    // Identity must also be resolved at click time: the closure-captured
+    // `identity` from button decoration is a stale snapshot that can
+    // mismatch the current active session in multi-window setups.
+    const liveIdentity = transcriptRecordIdentity(record);
+    if (!liveIdentity) {
+      showTranscriptToast(
+        'Internal: cannot resolve active session id; rerun aborted to avoid writing the wrong transcript.',
+        'error',
+      );
+      return;
+    }
+    const session = locateActiveSessionState();
+    const conn = locateConnection();
+    if (!session || typeof session.send !== 'function') {
+      showTranscriptToast(
+        'Internal: cannot reach session.send; rerun aborted (local history is unchanged).',
+        'error',
+      );
+      return;
+    }
+    const includeSelection = !!savedIdeRef;
+    const selectionWritable = !!(
+      session.selection &&
+      typeof session.selection === 'object' &&
+      'value' in session.selection
+    );
+    if (includeSelection && !selectionWritable) {
+      showTranscriptToast(
+        'Internal: cannot reach session.selection; rerun aborted to avoid dropping the IDE reference.',
+        'error',
+      );
+      return;
+    }
+
+    // Inflight visual on the rerun button so the click is acknowledged
+    // before IPC + the React unmount cascade. Without this the click
+    // produces no visible feedback for ~5–30ms (IPC) + ~200–500ms
+    // (slice + mass unmount of the user bubble + every following
+    // assistant/tool message + its diff islands and fold animations).
+    if (button) button.dataset.incipitInflight = '1';
+
+    let payload;
+    try {
+      payload = await requestTranscriptMutation('truncate_from_user', {
+        uuid: record.uuid,
+        ...liveIdentity,
+      });
+    } catch (error) {
+      if (button) button.removeAttribute('data-incipit-inflight');
+      showTranscriptToast(error && error.message ? error.message : String(error), 'error');
+      return;
+    }
+    if (!payload || payload.ok === false) {
+      if (button) button.removeAttribute('data-incipit-inflight');
+      showTranscriptToast((payload && payload.error) || 'Rerun failed', 'error');
+      return;
+    }
+
+    // Yield to the event loop so the browser paints the inflight state
+    // before the slice triggers React's synchronous mass unmount of
+    // the user bubble + every following message. Same total work, but
+    // the click feels acknowledged instead of frozen.
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    // Slice: drop this user + everything after. session.send will push
+    // the new (re-)user record; the host's launchClaude (called from
+    // inside session.send) then resumes the freshly-truncated JSONL.
+    let preRerunMessages = null;
+    if (session.messages && Array.isArray(session.messages.value)) {
+      const cur = session.messages.value;
+      const idx = transcriptRecordIndex(cur, record);
+      if (idx >= 0) {
+        preRerunMessages = cur;
+        try { session.messages.value = cur.slice(0, idx); } catch (_) {}
+      }
+    }
+    // Force the host's launchClaude inside session.send to spawn a
+    // fresh CLI process. With claudeChannelId still set, launchClaude
+    // is a no-op return — the OLD CLI would receive the new sendInput,
+    // which has stale in-memory message state from before our truncate.
+    {
+      const oldChannelId = session.claudeChannelId;
+      if (oldChannelId && conn && typeof conn.interruptClaude === 'function') {
+        try { conn.interruptClaude(oldChannelId); } catch (_) {}
+      }
+      try { session.claudeChannelId = null; } catch (_) {}
+      try { session.loadingPromise = undefined; } catch (_) {}
+    }
+
+    // Pre-poke `session.selection.value` to the saved IDE ref so
+    // `zB1` rebuilds the same `<ide_*>` text. Restore afterward so the
+    // host UI's "current selection" indicator returns to live IDE
+    // state. `lastSentSelection` is also cleared because session.send
+    // skips the selection block when it equals the last-sent value.
+    // Preflight already verified `session.selection` is writable when
+    // includeSelection is true, so the writes here are unconditional.
+    let didPoke = false;
+    let originalSelectionValue = null;
+    let originalLastSentSelection = null;
+    if (includeSelection) {
+      try {
+        originalSelectionValue = session.selection.value;
+        originalLastSentSelection = session.lastSentSelection;
+        session.selection.value = savedIdeRef;
+        session.lastSentSelection = null;
+        didPoke = true;
+      } catch (_) {}
+    }
+
+    try {
+      await session.send(prose, attachments, includeSelection);
+    } catch (error) {
+      let rollback = null;
+      let rollbackError = null;
+      if (payload && payload.rollbackToken) {
+        try {
+          rollback = await requestTranscriptMutation('rollback_truncate_from_user', {
+            uuid: record.uuid,
+            rollbackToken: payload.rollbackToken,
+            ...liveIdentity,
+          }, { allowBusy: true });
+        } catch (err) {
+          rollbackError = err;
+        }
+      }
+      const message = error && error.message ? error.message : String(error);
+      if (rollback && rollback.rolledBack) {
+        if (preRerunMessages && session.messages && Array.isArray(session.messages.value)) {
+          try { session.messages.value = preRerunMessages; } catch (_) {}
+        }
+        showTranscriptToast('Rerun send failed; local history was restored: ' + message, 'error');
+      } else if (rollback && rollback.reason === 'transcript_advanced') {
+        showTranscriptToast('Rerun send failed after a new transcript append started: ' + message, 'error');
+      } else if (rollbackError) {
+        const rollbackMessage = rollbackError && rollbackError.message ? rollbackError.message : String(rollbackError);
+        showTranscriptToast('Rerun send failed, and rollback failed: ' + rollbackMessage, 'error');
+      } else {
+        showTranscriptToast('Rerun send failed: ' + message, 'error');
+      }
+    } finally {
+      if (didPoke) {
+        try {
+          session.selection.value = originalSelectionValue;
+          session.lastSentSelection = originalLastSentSelection;
+        } catch (_) {}
+      }
+      if (button) button.removeAttribute('data-incipit-inflight');
+    }
+  }
+
+  // ---- Fork / Rewind dispatchers ----
+  //
+  // Five user-bubble actions all funnel through these helpers. The
+  // hard rule: every "rewind" or "fork" code path goes through the
+  // host's own SessionState / AppContext methods. We never roll our
+  // own file-checkpoint logic and never allocate a session ourselves.
+  //
+  //   • Fork (no rewind)   → context.forkConversation(sessionId, prose, prevUuid)
+  //   • Rewind only        → session.rewindCode(uuid)
+  //   • Rerun + rewind     → session.rewindCode(uuid)  → existing rerunFromUser
+  //   • Fork + rewind      → session.rewindCode(uuid)  → forkFromUser
+  //
+  // Preflight is fail-closed: if the host React shape drifted and we
+  // can't reach forkConversation / rewindCode, we toast and bail
+  // BEFORE any irreversible call. Rewind in particular touches disk —
+  // a half-applied rewind with a failing follow-up would leave the
+  // user with a foreign file state and an intact transcript.
+
+  // Walk messages.value backward from `record` looking for the
+  // nearest previous assistant/user message uuid. Mirrors the host
+  // Oo1 component's loop exactly (line ~2037 of webview/index.js
+  // 2.1.120). Returns null when `record` is the first user message
+  // — fork from there is undefined (host falls back to
+  // onCreateNewSession; we don't have that callback, so we simply
+  // refuse).
+  function findPrevUuidForFork(record) {
+    const session = locateActiveSessionState();
+    if (!session || !session.messages || !Array.isArray(session.messages.value)) {
+      return null;
+    }
+    const arr = session.messages.value;
+    const idx = transcriptRecordIndex(arr, record);
+    if (idx <= 0) return null;
+    for (let i = idx - 1; i >= 0; i--) {
+      const m = arr[i];
+      if (m && typeof m.uuid === 'string' && m.uuid &&
+          (m.type === 'assistant' || m.type === 'user')) {
+        return m.uuid;
+      }
+    }
+    return null;
+  }
+
+  // Run host-side file rewind. Returns true iff the host confirms
+  // canRewind and the meta-message was inserted by the host. On any
+  // failure path we toast with a clear message and return false; the
+  // caller MUST bail before taking any follow-up action (rerun /
+  // fork). This keeps the disk + transcript invariant: if we couldn't
+  // rewind, nothing else changes.
+  async function performRewindCode(record) {
+    if (!record || typeof record.uuid !== 'string' || !record.uuid) {
+      showTranscriptToast('Cannot rewind: no checkpoint anchor on this message', 'error');
+      return false;
+    }
+    const session = locateActiveSessionState();
+    if (!session || typeof session.rewindCode !== 'function') {
+      showTranscriptToast(
+        'Internal: cannot reach session.rewindCode; rewind aborted (no files were touched).',
+        'error',
+      );
+      return false;
+    }
+    let result;
+    try {
+      result = await session.rewindCode(record.uuid);
+    } catch (error) {
+      const msg = error && error.message ? error.message : String(error);
+      showTranscriptToast('Rewind code failed: ' + msg, 'error');
+      return false;
+    }
+    if (!result || result.canRewind === false) {
+      showTranscriptToast('Rewind code failed', 'error');
+      return false;
+    }
+    return true;
+  }
+
+  // Pure fork: clones session at `prevUuid`, seeds the new fork with
+  // this user's prose. Original session is untouched. Host owns
+  // openNewInTab / viewSession routing — we don't navigate.
+  async function forkFromUser(record, button) {
+    if (!record || record.type !== 'user') return;
+    record = liveTranscriptRecord(record.uuid, record);
+    if (record.isSynthetic || transcriptHasToolResult(record)) return;
+    if (isCompactSummaryRecord(record)) return;
+    if (conversationIsBusy()) return;
+
+    const session = locateActiveSessionState();
+    const ctx = locateActiveAppContext();
+    if (!ctx || typeof ctx.forkConversation !== 'function') {
+      showTranscriptToast(
+        'Internal: cannot reach context.forkConversation; fork aborted.',
+        'error',
+      );
+      return;
+    }
+    const sessionId = session && session.sessionId && session.sessionId.value;
+    if (!sessionId || typeof sessionId !== 'string') {
+      showTranscriptToast(
+        'Internal: cannot resolve current session id; fork aborted.',
+        'error',
+      );
+      return;
+    }
+    const prevUuid = findPrevUuidForFork(record);
+    if (!prevUuid) {
+      showTranscriptToast('Cannot fork from the first message', 'error');
+      return;
+    }
+    const { prose } = buildRerunPayloadFromRecord(record);
+    if (!prose) {
+      showTranscriptToast('No text content to fork with', 'error');
+      return;
+    }
+
+    if (button) button.dataset.incipitInflight = '1';
+    try {
+      await ctx.forkConversation(sessionId, prose, prevUuid);
+    } catch (error) {
+      showTranscriptToast(
+        'Fork failed: ' + (error && error.message ? error.message : String(error)),
+        'error',
+      );
+    } finally {
+      if (button) button.removeAttribute('data-incipit-inflight');
+    }
+  }
+
+  async function rewindOnlyFromUser(record, button) {
+    if (!record || record.type !== 'user') return;
+    record = liveTranscriptRecord(record.uuid, record);
+    if (isCompactSummaryRecord(record)) return;
+    if (conversationIsBusy()) return;
+    if (button) button.dataset.incipitInflight = '1';
+    try { await performRewindCode(record); }
+    finally { if (button) button.removeAttribute('data-incipit-inflight'); }
+  }
+
+  async function rerunWithRewindFromUser(record, button) {
+    if (!record || record.type !== 'user') return;
+    record = liveTranscriptRecord(record.uuid, record);
+    if (record.isSynthetic || transcriptHasToolResult(record)) return;
+    if (isCompactSummaryRecord(record)) return;
+    if (conversationIsBusy()) return;
+    if (button) button.dataset.incipitInflight = '1';
+    let rewound = false;
+    try {
+      rewound = await performRewindCode(record);
+    } finally {
+      if (!rewound && button) button.removeAttribute('data-incipit-inflight');
+    }
+    if (!rewound) return;
+    // rerunFromUser owns its own preflight + truncate + send + the
+    // inflight attr cleanup. We hand the same button forward; if rerun
+    // bails on its own preflight, it removes the inflight attr.
+    await rerunFromUser(record, button);
+  }
+
+  async function forkWithRewindFromUser(record, button) {
+    if (!record || record.type !== 'user') return;
+    record = liveTranscriptRecord(record.uuid, record);
+    if (record.isSynthetic || transcriptHasToolResult(record)) return;
+    if (isCompactSummaryRecord(record)) return;
+    if (conversationIsBusy()) return;
+    if (button) button.dataset.incipitInflight = '1';
+    let rewound = false;
+    try {
+      rewound = await performRewindCode(record);
+    } finally {
+      if (!rewound && button) button.removeAttribute('data-incipit-inflight');
+    }
+    if (!rewound) return;
+    await forkFromUser(record, button);
+  }
+
+  // ---- inline editor (replaces modal for edit_user / edit_assistant_text) ----
+  //
+  // Flow:
+  //   1. Mark the bubble's content node + the existing icon row with
+  //      `data-incipit-inline-edit-hidden` (CSS display:none !important).
+  //      We never delete host DOM — reconcile keeps thinking the icon row
+  //      is mounted, so it won't try to recreate it.
+  //   2. Inject a `[data-incipit-inline-edit-shell]` sibling holding a
+  //      transparent <textarea> (no border, body font, terra-red caret).
+  //   3. Inject an `[data-incipit-inline-edit-actions]` sibling next to
+  //      the original icon row, holding [取消] [保存] text buttons.
+  //   4. Save button respects `conversationIsBusy()`; sweep flips it.
+  //   5. Cancel / save / Esc / Ctrl-Enter all teardown — remove the
+  //      injected nodes and unhide the originals. Save also fires the
+  //      transcript mutation; reflect re-renders the bubble naturally.
+
+  const inlineEditByUuid = new Map();
+
+  function teardownInlineEditor(uuid) {
+    const state = inlineEditByUuid.get(uuid);
+    if (!state) return null;
+    inlineEditByUuid.delete(uuid);
+    // If the user opened an image preview from this editor's chip
+    // strip and then dismissed the editor (Esc / cancel / save) without
+    // first closing the preview, the overlay would otherwise linger as
+    // an orphan modal blocking the chat. Cheap to always call — no-op
+    // when no preview is open.
+    closeImagePreview();
+    if (state.shellEl && state.shellEl.parentElement) state.shellEl.remove();
+    if (state.editActionsEl && state.editActionsEl.parentElement) state.editActionsEl.remove();
+    if (state.contentEl) state.contentEl.removeAttribute('data-incipit-inline-edit-hidden');
+    if (state.originalActionRow) state.originalActionRow.removeAttribute('data-incipit-inline-edit-hidden');
+    // Re-show any host attachment pill rows we hid on entering edit. The
+    // host's user-bubble renders attachments either inside the bubble
+    // (short messages) or as a sibling above it (long messages); both
+    // carry [data-incipit-user-attachments]. Keeping the host node
+    // mounted (just CSS-hidden) lets the host's React render keep
+    // thinking it owns the bubble layout.
+    if (state.attachmentsEl) {
+      state.attachmentsEl.removeAttribute('data-incipit-inline-edit-hidden');
+    }
+    if (state.bubbleHost) state.bubbleHost.removeAttribute('data-incipit-inline-editing');
+    return state;
+  }
+
+  function cancelInlineEditor(uuid) {
+    teardownInlineEditor(uuid);
+  }
+
+  // ----- Chip strip helpers (user kind only) -----
+  //
+  // The chip strip lives above the textarea inside the user-bubble
+  // edit shell. Each chip represents a *kept* non-prose block
+  // (ide_opened_file ref, ide_selection ref, image attachment) or a
+  // *new* image the user paste/drops/file-picks during the edit.
+  // X removes a chip from the kept list; '+' opens a file picker for
+  // adding a new image.
+  //
+  // State lives on the inline-editor entry: state.chips is an array
+  // of chip descriptors mutated in place; renderChipStrip clears and
+  // re-renders the DOM each time. With at most a handful of chips per
+  // bubble, full re-render is simpler than diff-patching and produces
+  // no flicker (the whole strip is below the textarea anyway).
+
+  // 5 MB raw image cap. Anthropic accepts up to ~5MB per image; base64
+  // expands ~33% in transit but the source-side cap is the right gate.
+  const MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024;
+  const ALLOWED_INLINE_IMAGE_MIMES = new Set([
+    'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+  ]);
+
+  function renderInlineEditChipStrip(state) {
+    const container = state && state.chipsContainerEl;
+    if (!container) return;
+    container.replaceChildren();
+    for (const chip of state.chips) {
+      container.appendChild(buildChipElement(state, chip));
+    }
+    if (state.chipsAddBtn) container.appendChild(state.chipsAddBtn);
+    container.style.display = (state.chips.length || state.chipsAddBtn) ? '' : 'none';
+  }
+
+  function buildChipElement(state, chip) {
+    const el = document.createElement('span');
+    el.className = 'incipit-edit-chip';
+    el.setAttribute('data-incipit-edit-chip-kind', chip.blockKind);
+    el.setAttribute('data-chip-id', chip.chipId);
+
+    if (chip.blockKind === 'image') {
+      el.classList.add('incipit-edit-chip--image');
+      if (chip.dataUrl) {
+        const img = document.createElement('img');
+        img.className = 'incipit-edit-chip-thumb';
+        img.src = chip.dataUrl;
+        img.alt = '';
+        img.draggable = false;
+        el.appendChild(img);
+        // Click-to-preview. Mirrors host composer's pill click behaviour
+        // (cf. host bundle H40 component): clicking the chip body opens
+        // a fullscreen overlay with the image at natural-fit size, Esc
+        // or backdrop-click closes. The X button has its own handler
+        // that already stopPropagation's, so a click on X never reaches
+        // here; we still defensive-check `closest('.incipit-edit-chip-x')`
+        // for keyboard activation paths.
+        el.style.cursor = 'zoom-in';
+        el.setAttribute('role', 'button');
+        el.setAttribute('tabindex', '0');
+        el.setAttribute('aria-label', 'Preview image');
+        el.title = 'Click to preview';
+        el.addEventListener('click', (ev) => {
+          if (ev.target && ev.target.closest && ev.target.closest('.incipit-edit-chip-x')) return;
+          ev.preventDefault();
+          ev.stopPropagation();
+          openImagePreview(chip.dataUrl);
+        });
+        el.addEventListener('keydown', (ev) => {
+          if (ev.key !== 'Enter' && ev.key !== ' ') return;
+          if (ev.target && ev.target.closest && ev.target.closest('.incipit-edit-chip-x')) return;
+          ev.preventDefault();
+          ev.stopPropagation();
+          openImagePreview(chip.dataUrl);
+        });
+      } else {
+        // Defensive: image block without a usable data URL (rare, e.g.
+        // url-source images we don't render). Fall back to a neutral
+        // label so the user still sees "an image is attached" and can
+        // remove it.
+        const label = document.createElement('span');
+        label.className = 'incipit-edit-chip-label';
+        label.textContent = chip.mediaType || 'image';
+        el.appendChild(label);
+      }
+    } else {
+      // ide_opened_file / ide_selection / future ide_* fallback.
+      const icon = document.createElement('span');
+      icon.className = 'incipit-edit-chip-icon';
+      icon.innerHTML = CHIP_FILE_ICON_SVG;
+      el.appendChild(icon);
+      const label = document.createElement('span');
+      label.className = 'incipit-edit-chip-label';
+      label.textContent = chip.label || '';
+      el.appendChild(label);
+      if (chip.subLabel) {
+        const sub = document.createElement('span');
+        sub.className = 'incipit-edit-chip-sub';
+        sub.textContent = chip.subLabel;
+        el.appendChild(sub);
+      }
+      el.title = describeChipForTooltip(chip);
+    }
+
+    const x = document.createElement('button');
+    x.className = 'incipit-edit-chip-x';
+    x.type = 'button';
+    x.setAttribute('aria-label', 'Remove attachment');
+    x.innerHTML = CHIP_X_ICON_SVG;
+    x.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      removeInlineEditChip(state, chip.chipId);
+    });
+    el.appendChild(x);
+    return el;
+  }
+
+  function describeChipForTooltip(chip) {
+    if (chip.blockKind === 'ide_opened_file') return 'IDE auto-attached: opened file';
+    if (chip.blockKind === 'ide_selection') return 'IDE auto-attached: line selection';
+    return 'Attached reference (preserved across edit)';
+  }
+
+  // Fullscreen image preview overlay. Body-portal modal — sits above
+  // every other layer including dropdowns. Closes on Esc / backdrop
+  // click / close-button click. Single-instance: opening a new preview
+  // closes the previous one. Mirrors the behaviour of the host
+  // composer's pill click (cf. host bundle H40 component) so editing a
+  // user record feels visually consistent with composing a new one.
+  let activeImagePreview = null;
+  function openImagePreview(src) {
+    if (!src) return;
+    closeImagePreview();
+    const overlay = document.createElement('div');
+    overlay.setAttribute('data-incipit-image-preview', '');
+    overlay.tabIndex = -1;
+
+    const img = document.createElement('img');
+    img.setAttribute('data-incipit-image-preview-img', '');
+    img.src = src;
+    img.alt = '';
+    img.draggable = false;
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.setAttribute('data-incipit-image-preview-close', '');
+    closeBtn.setAttribute('aria-label', 'Close preview');
+    closeBtn.innerHTML = CHIP_X_ICON_SVG;
+
+    overlay.appendChild(img);
+    overlay.appendChild(closeBtn);
+
+    function onKey(e) {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      closeImagePreview();
+    }
+    overlay.addEventListener('click', (e) => {
+      // Only backdrop clicks close; clicks on the image or close button
+      // are handled separately. The image gets `cursor:default` via CSS
+      // so it doesn't read as clickable; the backdrop reads as
+      // `zoom-out` to invite the close gesture.
+      if (e.target === overlay) closeImagePreview();
+    });
+    img.addEventListener('click', (e) => { e.stopPropagation(); });
+    closeBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      closeImagePreview();
+    });
+    document.addEventListener('keydown', onKey, true);
+
+    document.body.appendChild(overlay);
+    setTimeout(() => { try { overlay.focus(); } catch (_) {} }, 0);
+
+    activeImagePreview = {
+      overlay,
+      teardown: () => {
+        document.removeEventListener('keydown', onKey, true);
+        if (overlay.parentElement) overlay.remove();
+      },
+    };
+  }
+
+  function closeImagePreview() {
+    if (!activeImagePreview) return;
+    try { activeImagePreview.teardown(); } catch (_) {}
+    activeImagePreview = null;
+  }
+
+  function removeInlineEditChip(state, chipId) {
+    if (!state || !chipId) return;
+    const idx = state.chips.findIndex(c => c.chipId === chipId);
+    if (idx < 0) return;
+    state.chips.splice(idx, 1);
+    renderInlineEditChipStrip(state);
+  }
+
+  // Add a brand-new image (paste/drop/file-pick) to the chip strip.
+  // Async because FileReader is async. Validates MIME + size first;
+  // toasts on rejection rather than failing silently.
+  function addInlineEditImageFromFile(state, file) {
+    if (!state || !file) return;
+    if (!ALLOWED_INLINE_IMAGE_MIMES.has(file.type)) {
+      showTranscriptToast(
+        `Only PNG, JPEG, GIF, and WebP images can be attached (got ${file.type || 'unknown'})`,
+        'error',
+      );
+      return;
+    }
+    if (file.size > MAX_INLINE_IMAGE_BYTES) {
+      showTranscriptToast(
+        `Image too large: ${(file.size / 1024 / 1024).toFixed(1)} MB (max 5 MB)`,
+        'error',
+      );
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      // dataUrl format: "data:image/png;base64,<b64>"
+      const m = /^data:([^;]+);base64,(.*)$/.exec(dataUrl);
+      if (!m) {
+        showTranscriptToast('Failed to encode image (unexpected reader output)', 'error');
+        return;
+      }
+      const mediaType = m[1];
+      const base64 = m[2];
+      state.chipsCounter = (state.chipsCounter || 0) + 1;
+      state.chips.push({
+        chipId: 'n-' + state.chipsCounter,
+        kind: 'image-new',
+        blockKind: 'image',
+        mediaType,
+        dataUrl,
+        source: { type: 'base64', media_type: mediaType, data: base64 },
+      });
+      renderInlineEditChipStrip(state);
+    };
+    reader.onerror = () => {
+      showTranscriptToast('Failed to read image file', 'error');
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // Save button busy state — parallel to applyButtonBusyState. The
+  // save button uses the same `data-incipit-disabled` convention so
+  // makeTranscriptActionButton's click handler swallows the click
+  // automatically, and CSS dims it. Title flips between live and
+  // streaming-explainer text.
+  function applyInlineSaveBusyState(saveBtn, busy) {
+    if (!saveBtn) return;
+    const want = !!busy;
+    const cur = saveBtn.dataset.incipitDisabled === '1';
+    if (want === cur) return;
+    if (want) {
+      saveBtn.dataset.incipitDisabled = '1';
+      saveBtn.setAttribute('aria-disabled', 'true');
+      saveBtn.setAttribute('title', 'Wait for the current reply to finish before saving');
+    } else {
+      delete saveBtn.dataset.incipitDisabled;
+      saveBtn.removeAttribute('aria-disabled');
+      if (saveBtn._incipitLiveTitle) {
+        saveBtn.setAttribute('title', saveBtn._incipitLiveTitle);
+      } else {
+        saveBtn.removeAttribute('title');
+      }
+    }
+  }
+
+  async function saveInlineEditor(uuid) {
+    const state = inlineEditByUuid.get(uuid);
+    if (!state) return;
+    if (conversationIsBusy()) return;
+    const text = state.textarea.value;
+    const op = state.kind === 'assistant' ? 'edit_assistant_text' : 'edit_user';
+
+    // Build blocks payload for user kind. We always go through the
+    // rich (blocks) path for user edits, never the legacy text-only
+    // path: the host's text-only path uses `replaceTextContent`, which
+    // walks the content array and overwrites the FIRST text block with
+    // the new prose. For multi-block records (ide_opened_file +
+    // user-prose, ide_selection + user-prose, image + user-prose) the
+    // first text block is the ide_* wrapper, so a text-only save would
+    // silently overwrite the ref while dropping the user's actual
+    // prose block. Blocks path eliminates this whole class of hazard
+    // by sending an explicit kept-by-index spec.
+    let blocksSpec = null;
+    if (state.kind === 'user') {
+      blocksSpec = [];
+      for (const chip of (state.chips || [])) {
+        if (chip.kind === 'keep' && Number.isInteger(chip.index)) {
+          blocksSpec.push({ kind: 'keep', index: chip.index });
+        } else if (chip.kind === 'image-new' && chip.source) {
+          blocksSpec.push({ kind: 'image', source: chip.source });
+        }
+      }
+      if (typeof text === 'string' && text.length > 0) {
+        blocksSpec.push({ kind: 'text', text });
+      }
+      if (blocksSpec.length === 0) {
+        showTranscriptToast(
+          'Nothing to save — type something or keep at least one attachment.',
+          'error',
+        );
+        return;
+      }
+    }
+
+    state.saveBtn.dataset.incipitInflight = '1';
+    state.cancelBtn.dataset.incipitInflight = '1';
+    let payload;
+    try {
+      const requestPayload = blocksSpec
+        ? { uuid, blocks: blocksSpec, ...(state.identity || {}) }
+        : { uuid, text, ...(state.identity || {}) };
+      payload = await requestTranscriptMutation(op, requestPayload);
+    } catch (error) {
+      if (state.saveBtn) state.saveBtn.removeAttribute('data-incipit-inflight');
+      if (state.cancelBtn) state.cancelBtn.removeAttribute('data-incipit-inflight');
+      showTranscriptToast(error && error.message ? error.message : String(error), 'error');
+      return;
+    }
+    // Teardown BEFORE reflect — otherwise React's mount of the new
+    // markdown root lands AFTER our hidden icon row + injected nodes,
+    // leaving the icon row stranded at the top of the bubble after
+    // teardown. Restoring DOM to the pre-edit shape first lets React
+    // reconcile in the same position the original markdown root held.
+    teardownInlineEditor(uuid);
+    // Yield to the event loop so the browser can paint the closed
+    // editor before reflect's synchronous React re-render of the edited
+    // markdown row stalls the main thread (re-parsing markdown, hljs,
+    // KaTeX). Without this, teardown + the React commit run in one
+    // task and the user perceives "click → frozen → done" with zero
+    // intermediate feedback. Same total work, much better responsiveness.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    if (blocksSpec) {
+      reflectUserEditBlocks(uuid, blocksSpec);
+    } else {
+      reflectTranscriptMutation(op, payload, text);
+    }
+  }
+
+  function openInlineEditor({ kind, record, bubbleHost, contentEl, originalActionRow, identity, initialText }) {
+    if (!record || !bubbleHost || !contentEl) return;
+    if (conversationIsBusy()) return;
+    const existing = inlineEditByUuid.get(record.uuid);
+    if (existing) {
+      try { existing.textarea.focus(); } catch (_) {}
+      return;
+    }
+    // Single-edit policy: cancel any other open editor before opening a new one.
+    for (const otherUuid of [...inlineEditByUuid.keys()]) {
+      if (otherUuid !== record.uuid) cancelInlineEditor(otherUuid);
+    }
+
+    // Anchor-scroll setup. Raw markdown is taller than the rendered version,
+    // so opening the editor pushes the row downward — the pencil that the
+    // user just clicked goes off-screen, and the new ✓/✗ icons end up far
+    // below where the click happened, breaking the "icons swapped in place"
+    // affordance. Capture the original action row's viewport Y *before* any
+    // DOM mutation, then re-align the scroll container after mutation so
+    // the saveBtn lands at the same screen Y the pencil sat at.
+    const anchorEl = originalActionRow || contentEl;
+    const anchorTopBefore = anchorEl ? anchorEl.getBoundingClientRect().top : null;
+    let scrollContainer = null;
+    if (anchorEl) {
+      let n = anchorEl.parentElement;
+      while (n) {
+        const cs = getComputedStyle(n);
+        if (/(auto|scroll)/.test(cs.overflowY) && n.scrollHeight > n.clientHeight) {
+          scrollContainer = n;
+          break;
+        }
+        n = n.parentElement;
+      }
+      if (!scrollContainer) scrollContainer = document.scrollingElement || document.documentElement;
+    }
+
+    const shell = document.createElement('div');
+    shell.className = 'incipit-inline-edit-shell';
+    shell.setAttribute('data-incipit-inline-edit-shell', kind);
+
+    // For user kind, build the chip strip + extract prose-only text.
+    // Refs (ide_opened_file / ide_selection) and image attachments
+    // become chips above the textarea; the textarea holds only the
+    // user's typed prose. Assistant edits are pure text — no chips.
+    let chipsContainer = null;
+    let chipsAddBtn = null;
+    let chipsFileInput = null;
+    let initialChips = [];
+    let textareaInitial = initialText || '';
+    if (kind === 'user') {
+      const classified = classifyUserRecordBlocks(record);
+      initialChips = classified.chips;
+      // Override caller's initialText (which joined all text blocks
+      // including the ide_* wrappers) with prose-only text. Wrappers
+      // round-trip via keep-by-index, not by being typed back into
+      // the textarea — typing them as text would let the user
+      // accidentally synthesize fake refs the host must reject.
+      textareaInitial = classified.proseText;
+
+      chipsContainer = document.createElement('div');
+      chipsContainer.className = 'incipit-edit-chip-strip';
+      chipsContainer.setAttribute('data-incipit-inline-edit-chips', '');
+      shell.appendChild(chipsContainer);
+
+      // '+' add-image button + hidden file input (multiple file pick).
+      // Paste/drop work too; the visible '+' is just affordance.
+      chipsFileInput = document.createElement('input');
+      chipsFileInput.type = 'file';
+      chipsFileInput.accept = 'image/png,image/jpeg,image/gif,image/webp';
+      chipsFileInput.multiple = true;
+      chipsFileInput.style.display = 'none';
+      shell.appendChild(chipsFileInput);
+
+      chipsAddBtn = document.createElement('button');
+      chipsAddBtn.className = 'incipit-edit-chip-add';
+      chipsAddBtn.type = 'button';
+      chipsAddBtn.title = 'Attach image (paste or drop also works)';
+      chipsAddBtn.setAttribute('aria-label', 'Attach image');
+      chipsAddBtn.innerHTML = CHIP_PLUS_ICON_SVG;
+      chipsAddBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        chipsFileInput.value = '';
+        chipsFileInput.click();
+      });
+      chipsFileInput.addEventListener('change', () => {
+        const state = inlineEditByUuid.get(record.uuid);
+        if (!state) return;
+        for (const f of Array.from(chipsFileInput.files || [])) {
+          addInlineEditImageFromFile(state, f);
+        }
+      });
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.className = 'incipit-inline-edit-textarea';
+    textarea.setAttribute('data-incipit-inline-edit-textarea', '');
+    textarea.spellcheck = false;
+    textarea.value = textareaInitial;
+    textarea.rows = 1;
+    shell.appendChild(textarea);
+
+    // Image paste/drop handlers (user kind only). Paste captures
+    // clipboardData image items; drop captures dragged-in files.
+    // Text paste falls through to the textarea's natural behaviour.
+    if (kind === 'user') {
+      textarea.addEventListener('paste', (ev) => {
+        const items = (ev.clipboardData && ev.clipboardData.items) || [];
+        let handled = false;
+        const state = inlineEditByUuid.get(record.uuid);
+        for (const it of items) {
+          if (it.kind === 'file' && /^image\//.test(it.type || '')) {
+            const file = it.getAsFile && it.getAsFile();
+            if (file && state) {
+              addInlineEditImageFromFile(state, file);
+              handled = true;
+            }
+          }
+        }
+        if (handled) {
+          ev.preventDefault();
+          ev.stopPropagation();
+        }
+      });
+      shell.addEventListener('dragover', (ev) => {
+        // Only signal accept when an image-ish file is being dragged;
+        // suppresses VS Code's editor-level default for image drops.
+        const dt = ev.dataTransfer;
+        if (!dt) return;
+        const types = dt.types || [];
+        const looksLikeFile = Array.prototype.indexOf.call(types, 'Files') !== -1;
+        if (looksLikeFile) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          try { dt.dropEffect = 'copy'; } catch (_) {}
+        }
+      });
+      shell.addEventListener('drop', (ev) => {
+        const dt = ev.dataTransfer;
+        if (!dt) return;
+        const files = Array.from(dt.files || []).filter(f => /^image\//.test(f.type || ''));
+        if (!files.length) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        const state = inlineEditByUuid.get(record.uuid);
+        if (!state) return;
+        for (const f of files) addInlineEditImageFromFile(state, f);
+      });
+    }
+
+    const editActions = document.createElement('div');
+    editActions.className = 'incipit-transcript-action-row incipit-inline-edit-actions';
+    editActions.setAttribute('data-incipit-inline-edit-actions', kind);
+
+    // SVG icon buttons (matching the original three-icon row family).
+    // makeTranscriptActionButton wires stopPropagation, the
+    // `data-incipit-disabled` swallow guard, and stashes _incipitLive*
+    // for reuse by busy-state flips.
+    const cancelBtn = makeTranscriptActionButton(
+      'cancel',
+      'Cancel edit (Esc)',
+      CANCEL_ICON_SVG,
+      () => cancelInlineEditor(record.uuid),
+    );
+    const saveBtn = makeTranscriptActionButton(
+      'save',
+      'Save (Ctrl+Enter)',
+      SAVE_ICON_SVG,
+      () => saveInlineEditor(record.uuid),
+    );
+
+    editActions.append(cancelBtn, saveBtn);
+
+    // DOM injection.
+    // Shell — always adjacent to the content node it replaces.
+    if (contentEl.parentElement) {
+      contentEl.parentElement.insertBefore(shell, contentEl.nextSibling);
+    } else {
+      bubbleHost.appendChild(shell);
+    }
+    // Edit-actions — placement depends on kind:
+    //  - user: inside the bubble itself, after the shell, so the
+    //    cancel/save pair sits at the bottom-right of the expanded
+    //    draft card (the bubble carries the visual identity).
+    //  - assistant: outside the markdown root, next to the original
+    //    icon row at message-host level, matching the original AI
+    //    action row position (below the warm draft card).
+    let editActionsPlaced = false;
+    if (kind === 'user') {
+      const userBubbleEl = contentEl.closest('[data-incipit-user-bubble]');
+      if (userBubbleEl) {
+        userBubbleEl.appendChild(editActions);
+        editActionsPlaced = true;
+      }
+    }
+    if (!editActionsPlaced) {
+      if (originalActionRow && originalActionRow.parentElement) {
+        originalActionRow.parentElement.insertBefore(editActions, originalActionRow.nextSibling);
+      } else {
+        bubbleHost.appendChild(editActions);
+      }
+    }
+
+    // Hide originals via attr (CSS handles display:none).
+    contentEl.setAttribute('data-incipit-inline-edit-hidden', '');
+    if (originalActionRow) originalActionRow.setAttribute('data-incipit-inline-edit-hidden', '');
+    // For user kind: also hide the host-rendered attachment pill row
+    // (`[data-incipit-user-attachments]`). The host renders it either
+    // inside the user bubble (short messages) or as a sibling above the
+    // bubble (long messages). Without this hide, both the host's pills
+    // *and* our chip strip render simultaneously, showing the same
+    // images twice with two different visual styles. Scope query at the
+    // userMessageContainer level to cover both layouts.
+    let attachmentsEl = null;
+    if (kind === 'user') {
+      attachmentsEl = bubbleHost.querySelector(SEL.userAttachments);
+      if (attachmentsEl) {
+        attachmentsEl.setAttribute('data-incipit-inline-edit-hidden', '');
+      }
+    }
+    bubbleHost.setAttribute('data-incipit-inline-editing', kind);
+
+    const autoGrow = () => {
+      textarea.style.height = 'auto';
+      textarea.style.height = textarea.scrollHeight + 'px';
+    };
+    textarea.addEventListener('input', autoGrow);
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelInlineEditor(record.uuid);
+      } else if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        saveInlineEditor(record.uuid);
+      }
+    });
+    inlineEditByUuid.set(record.uuid, {
+      kind,
+      record,
+      bubbleHost,
+      contentEl,
+      shellEl: shell,
+      textarea,
+      saveBtn,
+      cancelBtn,
+      editActionsEl: editActions,
+      originalActionRow: originalActionRow || null,
+      identity: identity || null,
+      // Chip strip state (user kind only). chips is mutated in place
+      // by removeInlineEditChip / addInlineEditImageFromFile;
+      // renderInlineEditChipStrip clears + repaints `chipsContainerEl`
+      // each time. chipsCounter namespace 'n-N' keeps new-image chip
+      // ids distinct from the 'k-N' keep-chip ids minted by the
+      // classifier, even though render uses chipId only as a DOM key.
+      chips: initialChips,
+      chipsContainerEl: chipsContainer,
+      chipsAddBtn,
+      chipsFileInput,
+      chipsCounter: 0,
+      attachmentsEl,
+    });
+
+    if (kind === 'user') {
+      const seedState = inlineEditByUuid.get(record.uuid);
+      renderInlineEditChipStrip(seedState);
+    }
+
+    applyInlineSaveBusyState(saveBtn, conversationIsBusy());
+
+    // Realign the scroll container so the saveBtn sits at the same screen
+    // Y the click target was at. Two passes — synchronous (covers shell
+    // injection + contentEl hide) and post-autoGrow (covers textarea
+    // expanding to its full scrollHeight). `preventScroll: true` on focus
+    // is required: without it the browser does its own scrollIntoView on
+    // the textarea and fights our anchor in the same tick.
+    const realignToAnchor = () => {
+      if (anchorTopBefore == null || !scrollContainer || !saveBtn) return;
+      const r = saveBtn.getBoundingClientRect();
+      if (!r.height) return;
+      const delta = r.top - anchorTopBefore;
+      if (Math.abs(delta) > 0.5) scrollContainer.scrollTop += delta;
+    };
+    realignToAnchor();
+
+    // Focus + autosize on the next tick so layout has settled.
+    setTimeout(() => {
+      try {
+        autoGrow();
+        textarea.focus({ preventScroll: true });
+        textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+        realignToAnchor();
+      } catch (_) {}
+    }, 0);
+  }
+
+  // Prefer `[class*="content_"]` text. Fall back to the bubble text with
+  // attachments and injected controls removed.
+  function userBubbleText(bubbleEl) {
+    const content = bubbleEl.querySelector(SEL.userContent);
+    if (content) return content.textContent || '';
+    const clone = bubbleEl.cloneNode(true);
+    clone.querySelectorAll(
+      `${SEL.userAttachments}, .claude-user-copy-btn, .claude-user-copy-btn-row`
+    ).forEach(n => n.remove());
+    return clone.textContent || '';
+  }
+
+  // Walk upward to the outer `userMessageContainer`, which hosts the sibling row.
+  function findUserMessageHost(bubbleEl) {
+    return closestByAttr(bubbleEl, ATTR.userMessageContainer);
+  }
+
+  // Copy block, used as-is by AI-turn dropdowns and appended below
+  // the rewind block on user-bubble dropdowns. `getMarkdown()` is
+  // lazy so big-document text extraction doesn't run on every
+  // reconcile.
+  function buildCopyDropdownItems(getMarkdown) {
+    return [
+      {
+        label: 'Copy as text',
+        icon: COPY_AS_TEXT_ICON_SVG,
+        onClick: () => {
+          const md = (getMarkdown() || '').toString();
+          copyText(markdownToPlainText(md));
+        },
+      },
+      {
+        label: 'Copy as markdown',
+        icon: COPY_AS_MARKDOWN_ICON_SVG,
+        onClick: () => {
+          copyText((getMarkdown() || '').toString());
+        },
+      },
+    ];
+  }
+
+  // User-bubble dropdown — five rewind/fork variants on top, then the
+  // copy pair below a separator. `liveRecord` resolves uuid → current
+  // Ez instance at click time (post-edit content, post-rerun staleness
+  // both handled). `hasPrevUuid` lets us disable fork-with-rewind on
+  // the very first user message; the `Fork` main button itself is
+  // simply not added in that case (see addUserCopyButton).
+  //
+  // Rewind block disabled snapshot: streaming gates the entire
+  // rewind/fork family. We snapshot once at popup-open time. If the
+  // stream finishes while the popup is still open, the user closes
+  // and reopens — cheap enough.
+  function buildUserDropdownItems(liveRecord, getMarkdown, hasPrevUuid) {
+    let busyAtOpen = false;
+    try { busyAtOpen = conversationIsBusy(); } catch (_) { busyAtOpen = false; }
+    const rewindBlocked = busyAtOpen;
+    const forkBlocked = busyAtOpen || !hasPrevUuid;
+    return [
+      {
+        label: 'Rerun with code rewind',
+        icon: RERUN_ICON_SVG,
+        disabled: rewindBlocked,
+        title: rewindBlocked ? 'Disabled while streaming' : '',
+        onClick: () => { rerunWithRewindFromUser(liveRecord(), null); },
+      },
+      {
+        label: 'Fork with code rewind',
+        icon: FORK_ICON_SVG,
+        disabled: forkBlocked,
+        title: forkBlocked
+          ? (busyAtOpen ? 'Disabled while streaming' : 'Cannot fork from the first message')
+          : '',
+        onClick: () => { forkWithRewindFromUser(liveRecord(), null); },
+      },
+      {
+        label: 'Rewind code only',
+        icon: REWIND_ONLY_ICON_SVG,
+        disabled: rewindBlocked,
+        title: rewindBlocked ? 'Disabled while streaming' : '',
+        onClick: () => { rewindOnlyFromUser(liveRecord(), null); },
+      },
+      { type: 'separator' },
+      ...buildCopyDropdownItems(getMarkdown),
+    ];
+  }
+
+  // Every user bubble gets pencil + pen-nib rerun + more (copy
+  // dropdown). Synthetic / tool-result-only "user" entries (rare —
+  // tool results don't normally render through SEL.userBubble) only
+  // get the more dropdown so copy still works without exposing
+  // edit/rerun on a record that isn't really user input.
+  function addUserCopyButton(bubbleEl) {
+    const host = findUserMessageHost(bubbleEl);
+    if (!host) return;
+    if (host.querySelector(':scope > .claude-user-copy-btn-row')) return;
+    const record = transcriptRecordForElement(host) || transcriptRecordForElement(bubbleEl);
+    const row = document.createElement('div');
+    row.className = 'claude-user-copy-btn-row incipit-transcript-action-row';
+
+    const isRealUser = !!(
+      record &&
+      record.type === 'user' &&
+      !record.isSynthetic &&
+      !transcriptHasToolResult(record) &&
+      !isCompactSummaryRecord(record)
+    );
+    const identity = isRealUser ? transcriptRecordIdentity(record) : null;
+    // Closures below capture `record` once at decoration time; saving
+    // an edit replaces the Ez instance in messages.value (uuid stable),
+    // so always rehydrate by uuid before reading text.
+    const capturedUuid = record && record.uuid;
+    const liveRecord = () => liveTranscriptRecord(capturedUuid, record);
+    const getMarkdown = () => {
+      const t = isRealUser ? transcriptText(liveRecord()) : '';
+      return t || userBubbleText(bubbleEl).trim();
+    };
+
+    if (isRealUser) {
+      // Pencil — open inline editor for this user record.
+      row.appendChild(makeTranscriptActionButton(
+        'edit',
+        'Edit user message (local history only)',
+        EDIT_ICON_SVG,
+        () => {
+          const cur = liveRecord();
+          const userContentEl = bubbleEl.querySelector(SEL.userContent) || bubbleEl;
+          const initialText = transcriptText(cur) || userBubbleText(bubbleEl).trim();
+          openInlineEditor({
+            kind: 'user',
+            record: cur,
+            bubbleHost: host,
+            contentEl: userContentEl,
+            originalActionRow: row,
+            identity,
+            initialText,
+          });
+        }
+      ));
+      // Reprise arrow — rerun this turn. Drops everything from this user
+      // forward and replays the text through the host's send pipeline.
+      // rerunFromUser internally re-resolves to the live record and
+      // toggles inflight on this button while the IPC roundtrip runs.
+      // Identity is also re-derived inside rerunFromUser at click time
+      // to avoid the closure-captured snapshot drifting under us in
+      // multi-window setups.
+      const rerunBtn = makeTranscriptActionButton(
+        'rerun',
+        'Rerun this turn',
+        RERUN_ICON_SVG,
+        () => { rerunFromUser(liveRecord(), rerunBtn); }
+      );
+      row.appendChild(rerunBtn);
+      // Fork (git-branch Y) — clones the conversation at this point
+      // into a new session and seeds it with this user's prose. The
+      // current session is left untouched, so this is non-destructive
+      // unlike rerun. We only mount the button when a prevUuid exists;
+      // the host's fork API has no meaningful behaviour on the very
+      // first user message (it would degrade to "create new session"
+      // for which we don't have the host's onCreateNewSession callback
+      // wired).
+      const hasPrev = !!findPrevUuidForFork(record);
+      if (hasPrev) {
+        const forkBtn = makeTranscriptActionButton(
+          'fork',
+          'Fork conversation from here',
+          FORK_ICON_SVG,
+          () => { forkFromUser(liveRecord(), forkBtn); }
+        );
+        row.appendChild(forkBtn);
+      }
+    }
+
+    // More — always present. User bubbles get the full rewind/fork
+    // dropdown plus copy pair; tool-result-only "user" entries get
+    // copy only (real-user gate above), so we pick the right builder
+    // here at popup-open time.
+    const moreBtn = makeTranscriptActionButton(
+      'more',
+      'More actions',
+      MORE_ICON_SVG,
+      () => {
+        if (isRealUser) {
+          const hasPrev = !!findPrevUuidForFork(liveRecord());
+          openActionDropdown(moreBtn, buildUserDropdownItems(liveRecord, getMarkdown, hasPrev));
+        } else {
+          openActionDropdown(moreBtn, buildCopyDropdownItems(getMarkdown));
+        }
+      }
+    );
+    row.appendChild(moreBtn);
+
+    host.appendChild(row);
+  }
+
+  // ---- custom show-more handling ----
+  //
+  // Measure the bubble, classify it as `short` or `long`, and replace the
+  // host truncation UI with a custom show-more row when needed.
+  const LONG_THRESHOLD_PX = 600;
+
+  // Walk up to find the nearest scrollable ancestor. Falls back to `window`
+  // if no ancestor scrolls. Claude Code keeps the transcript in an overflow
+  // container, so show-less anchor compensation cannot rely on window.scrollBy
+  // alone.
+  function findScrollAncestor(el) {
+    let p = el.parentElement;
+    while (p) {
+      const s = getComputedStyle(p);
+      const oy = s.overflowY;
+      if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') &&
+          p.scrollHeight > p.clientHeight) {
+        return p;
+      }
+      p = p.parentElement;
+    }
+    return window;
+  }
+
+  function preserveScrollAnchor(el, beforeTop) {
+    if (!el) return;
+    const afterTop = el.getBoundingClientRect().top;
+    const delta = afterTop - beforeTop;
+    if (delta !== 0) {
+      const scroller = findScrollAncestor(el);
+      if (scroller === window) window.scrollBy(0, delta);
+      else scroller.scrollTop += delta;
+    }
+  }
+
+  function addShowMoreRow(bubble) {
+    if (bubble.querySelector(':scope > .claude-show-more-row')) return;
+    const row = document.createElement('div');
+    row.className = 'claude-show-more-row';
+    const btn = document.createElement('button');
+    btn.className = 'claude-show-more-btn';
+    btn.type = 'button';
+    btn.textContent = 'Show more';
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const expanded = bubble.getAttribute('data-claude-expanded') === '1';
+      if (expanded) {
+        const beforeTop = btn.getBoundingClientRect().top;
+        bubble.removeAttribute('data-claude-expanded');
+        btn.textContent = 'Show more';
+        preserveScrollAnchor(btn, beforeTop);
+      } else {
+        bubble.setAttribute('data-claude-expanded', '1');
+        btn.textContent = 'Show less';
+      }
+    });
+    row.appendChild(btn);
+    bubble.appendChild(row);
+  }
+
+  function classifyUserBubble(bubble) {
+    const existing = bubble.getAttribute('data-claude-length');
+    if (existing === 'short' || existing === 'long') return;
+    const content = bubble.querySelector(SEL.userContent);
+    if (!content) return;
+    // Temporarily remove clipping to measure the natural height.
+    bubble.setAttribute('data-claude-length', 'measuring');
+    const h = content.scrollHeight;
+    if (h === 0) {
+      // Layout is not ready yet. Clear the marker and retry on the next scan.
+      bubble.removeAttribute('data-claude-length');
+      return;
+    }
+    if (h <= LONG_THRESHOLD_PX) {
+      bubble.setAttribute('data-claude-length', 'short');
+    } else {
+      bubble.setAttribute('data-claude-length', 'long');
+      addShowMoreRow(bubble);
+    }
+  }
+
+  function findAssistantActionHost(markdownRoot) {
+    const message = closestByAttr(markdownRoot, ATTR.message) ||
+      (markdownRoot.closest && markdownRoot.closest('[class*="timelineMessage"]'));
+    if (!message) return null;
+    if (message.closest(SEL.userMessageContainer) ||
+        message.closest('[class*="userMessageContainer"]')) return null;
+    if (markdownRoot.closest(SEL.toolUse)) return null;
+    if (markdownRoot.closest(SEL.thinking) ||
+        markdownRoot.closest(SEL.thinkingSummary) ||
+        markdownRoot.closest(SEL.thinkingContent) ||
+        markdownRoot.closest('[class*="thinking"]')) return null;
+    return message;
+  }
+
+  // A jsonl transcript splits one user-visible AI reply into many
+  // assistant records (thinking / text / tool_use each become a record
+  // sharing the same `requestId`). The action row should appear once
+  // per turn, on the *last* assistant record before the next real user
+  // input — not on every text record in the middle. tool_result-only
+  // user records are tool roundtrips, not turn breaks.
+  function isLastAssistantOfTurn(record) {
+    if (!record || record.type !== 'assistant') return false;
+    const session = locateActiveSessionState();
+    const messages = session && session.messages && session.messages.value;
+    if (!Array.isArray(messages)) return true;
+    const idx = transcriptRecordIndex(messages, record);
+    if (idx < 0) return true;
+    for (let i = idx + 1; i < messages.length; i++) {
+      const next = messages[i];
+      if (!next || typeof next !== 'object') continue;
+      const t = next.type;
+      if (t === 'assistant') return false;
+      if (t === 'user') {
+        if (transcriptHasToolResult(next)) continue;
+        return true;
+      }
+    }
+    return true;
+  }
+
+  function lastAssistantTextRecordOfTurn() {
+    const session = locateActiveSessionState();
+    const messages = session && session.messages && session.messages.value;
+    if (!Array.isArray(messages) || messages.length === 0) return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (!m || typeof m !== 'object') continue;
+      if (m.type === 'assistant') {
+        return transcriptHasText(m) && isLastAssistantOfTurn(m) ? m : null;
+      }
+      if (m.type === 'user' && transcriptHasToolResult(m)) continue;
+      if (m.type === 'progress' || m.type === 'system') continue;
+      return null;
+    }
+    return null;
+  }
+
+  function recordUuid(record) {
+    return (typeof record?.uuid === 'string' && record.uuid) ? record.uuid : '';
+  }
+
+  function recordBetaMessageId(record) {
+    return (typeof record?.betaMessageId === 'string' && record.betaMessageId)
+      ? record.betaMessageId
+      : '';
+  }
+
+  function sameTranscriptRecord(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    const uuid = recordUuid(a);
+    if (uuid && uuid === recordUuid(b)) return true;
+    const beta = recordBetaMessageId(a);
+    return !!(beta && beta === recordBetaMessageId(b));
+  }
+
+  function transcriptRecordIndex(messages, record) {
+    if (!Array.isArray(messages) || !record) return -1;
+    let idx = messages.findIndex(m => m === record);
+    if (idx >= 0) return idx;
+    const uuid = recordUuid(record);
+    if (uuid) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (recordUuid(messages[i]) === uuid) return i;
+      }
+    }
+    const beta = recordBetaMessageId(record);
+    if (beta) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (recordBetaMessageId(messages[i]) === beta) return i;
+      }
+    }
+    return -1;
+  }
+
+  function normalizeActionText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function markdownRootMatchesRecord(root, record) {
+    if (!root || !record) return false;
+    const recordText = normalizeActionText(transcriptText(record));
+    const rootText = normalizeActionText(root.textContent || '');
+    if (!recordText || !rootText) return false;
+    if (rootText === recordText) return true;
+    const tail = recordText.slice(Math.max(0, recordText.length - 240));
+    return tail.length >= 24 && rootText.includes(tail);
+  }
+
+  function lastAssistantMarkdownRoot(record = null) {
+    const roots = Array.from(document.querySelectorAll(SEL.markdownRoot));
+    let fallback = null;
+    for (let i = roots.length - 1; i >= 0; i--) {
+      const root = roots[i];
+      if (!root || !root.isConnected) continue;
+      if (!findAssistantActionHost(root)) continue;
+      if (!fallback) fallback = root;
+      if (!record || markdownRootMatchesRecord(root, record)) return root;
+    }
+    return record ? null : fallback;
+  }
+
+  function placeAssistantActionRow(host, markdownRoot, row) {
+    if (!host || !markdownRoot || !row) return;
+    let anchor = markdownRoot;
+    while (anchor.parentElement && anchor.parentElement !== host) {
+      anchor = anchor.parentElement;
+    }
+    if (anchor.parentElement === host) {
+      if (anchor.nextSibling !== row) host.insertBefore(row, anchor.nextSibling);
+      return;
+    }
+    host.appendChild(row);
+  }
+
+  // Returns true when the record is the trailing assistant of the
+  // *current* (still-streaming) turn — i.e. busy=true AND this record
+  // sits at the tail of `messages.value` (skipping tool_result-only
+  // user records as tool roundtrips). We refuse to decorate this case
+  // because the "turn end" is still moving; a row pinned now would
+  // either flicker mid-stream or end up on the wrong block. Past turns
+  // (real user input present after this record) stay decorated; sweep
+  // marks their edit/delete disabled until streaming ends.
+  function isCurrentlyStreamingRecord(record) {
+    if (!record || record.type !== 'assistant') return false;
+    if (!conversationIsBusy()) return false;
+    const session = locateActiveSessionState();
+    const messages = session && session.messages && session.messages.value;
+    if (!Array.isArray(messages) || messages.length === 0) return false;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (!m) continue;
+      if (m.type === 'assistant') return sameTranscriptRecord(m, record);
+      if (m.type === 'user' && transcriptHasToolResult(m)) continue;
+      return false;
+    }
+    return false;
+  }
+
+  // AI text turns get a 2-icon row at the markdown end: pencil (edit
+  // local transcript) + more (copy as text/markdown). No delete:
+  // destructive operations live on user bubbles only, where they have
+  // a clean truncate-and-rerun semantic. No standalone copy: copy
+  // sits inside the more dropdown. Mid-turn assistant records
+  // (thinking / tool_use / interrupted-tool-end) get nothing — the
+  // turn boundary is the user's input, not the assistant's last block.
+  function reconcileAssistantTranscriptActions(markdownRoot, fallbackRecord = null) {
+    const host = findAssistantActionHost(markdownRoot);
+    if (!host) return;
+    const existingRow = host.querySelector(':scope > .incipit-assistant-action-row');
+    // Fast path: row already decorated. Once a record is the last
+    // assistant text of its turn, that property is monotone (records
+    // are append-only; rerun unmounts the corresponding DOM, taking
+    // the row with it). So we can skip the fiber pierce + O(N)
+    // isLastAssistantOfTurn scan entirely, and only do the cheap
+    // placement check + busy-state sync. Without this short-circuit
+    // the post-mutation burst (`runTranscriptActionScanBurst`) repeats
+    // those expensive resolves once per markdown root × 14 frames,
+    // producing the 2–3 s freeze users see after /compact, Enter,
+    // and Interrupt. Idle→busy transitions still flip past-turn rows
+    // to disabled via the busy-state observer's `cleanupDuringBusy`.
+    if (existingRow) {
+      placeAssistantActionRow(host, markdownRoot, existingRow);
+      existingRow.querySelectorAll('.incipit-transcript-action-btn')
+        .forEach(b => applyButtonBusyState(b, conversationIsBusy()));
+      return;
+    }
+    const domRecord = transcriptRecordForElement(host) || transcriptRecordForElement(markdownRoot);
+    const domRecordLooksFinal = !!(
+      domRecord &&
+      domRecord.type === 'assistant' &&
+      transcriptHasText(domRecord) &&
+      isLastAssistantOfTurn(domRecord)
+    );
+    const record = domRecordLooksFinal ? domRecord : (fallbackRecord || domRecord);
+    const shouldShow = !!(
+      record &&
+      record.type === 'assistant' &&
+      transcriptHasText(record) &&
+      isLastAssistantOfTurn(record) &&
+      !isCurrentlyStreamingRecord(record)
+    );
+    if (!shouldShow) return;
+    // Iron streaming gate: never mint a brand-new row while a reply is in
+    // flight. Streaming mutations only mark the transcript dirty; the
+    // settle scanner materialises final assistant rows after idle + quiet.
+    if (conversationIsBusy()) return;
+
+    const row = document.createElement('div');
+    row.className = 'incipit-transcript-action-row incipit-assistant-action-row';
+    const identity = transcriptRecordIdentity(record);
+    // Re-resolve the record by uuid at click time — see addUserCopyButton.
+    const capturedUuid = record && record.uuid;
+    const liveRecord = () => liveTranscriptRecord(capturedUuid, record);
+    const getMarkdown = () => transcriptText(liveRecord()) || markdownRoot.textContent || '';
+
+    const editBtn = makeTranscriptActionButton('edit', 'Edit AI output (local history only)', EDIT_ICON_SVG, async () => {
+      let cur = liveRecord();
+      cur = await ensureAssistantRecordUuid(cur);
+      if (!cur || !recordUuid(cur)) {
+        showTranscriptToast(
+          'Local history is still syncing this assistant message; try again in a moment.',
+          'warn',
+        );
+        noteTranscriptActionMutation();
+        return;
+      }
+      openInlineEditor({
+        kind: 'assistant',
+        record: cur,
+        bubbleHost: host,
+        contentEl: markdownRoot,
+        originalActionRow: row,
+        identity: transcriptRecordIdentity(cur) || identity,
+        initialText: transcriptText(cur) || markdownRoot.textContent || '',
+      });
+    });
+    row.appendChild(editBtn);
+    // Edit hover preview: hover the pencil → markdown root paints with
+    // the inline-edit draft-card colour (same as a real edit click
+    // produces). Skip when disabled by streaming gate; idle→busy
+    // transition also clears the attr eagerly elsewhere so hover-in-
+    // flight doesn't linger on a now-disabled icon.
+    editBtn.addEventListener('mouseenter', () => {
+      if (editBtn.dataset.incipitDisabled === '1') return;
+      markdownRoot.setAttribute('data-incipit-edit-hover-preview', '1');
+    });
+    editBtn.addEventListener('mouseleave', () => {
+      markdownRoot.removeAttribute('data-incipit-edit-hover-preview');
+    });
+
+    const moreBtn = makeTranscriptActionButton('more', 'More actions', MORE_ICON_SVG, () => {
+      openActionDropdown(moreBtn, buildCopyDropdownItems(getMarkdown));
+    });
+    row.appendChild(moreBtn);
+
+    placeAssistantActionRow(host, markdownRoot, row);
+  }
+
+  function scanAssistantTranscriptActions(root) {
+    const scope = root || document.body;
+    if (!scope) return;
+    if (scope.matches && scope.matches(SEL.markdownRoot)) reconcileAssistantTranscriptActions(scope);
+    if (scope.querySelectorAll) {
+      const markdownRoots = scope.querySelectorAll(SEL.markdownRoot);
+      for (const markdownRoot of markdownRoots) reconcileAssistantTranscriptActions(markdownRoot);
+    }
+    if (!conversationIsBusy()) {
+      // Final text rows can miss the normal DOM→fiber record lookup: React may
+      // have committed the markdown DOM before the exact message record is
+      // discoverable from that node. The active SessionState is canonical, so
+      // use it as a fallback for the *last* assistant markdown root only.
+      const fallbackRecord = lastAssistantTextRecordOfTurn();
+      const fallbackRoot = fallbackRecord && lastAssistantMarkdownRoot(fallbackRecord);
+      if (fallbackRoot) reconcileAssistantTranscriptActions(fallbackRoot, fallbackRecord);
+    }
+    sweepStreamingDisableState();
+  }
+
+  function scanAndAddCopyButtons(root, options = {}) {
+    const scope = root || document.body;
+    if (!scope) return;
+    const assistantActions = options.assistantActions !== false;
+    const handle = (bubble) => {
+      // Interrupted messages are not real user input.
+      if (bubble.querySelector(SEL.interruptedMessage)) return;
+      addUserCopyButton(bubble);
+      classifyUserBubble(bubble);
+    };
+    if (scope.matches && scope.matches(SEL.userBubble)) handle(scope);
+    if (!scope.querySelectorAll) return;
+    const userBubbles = scope.querySelectorAll(SEL.userBubble);
+    for (const bubble of userBubbles) handle(bubble);
+    if (assistantActions) {
+      scanAssistantTranscriptActions(scope);
+    } else {
+      // Sweep at the end so newly-mounted user-bubble rows (created above
+      // by addUserCopyButton) snap to the current busy state in the same
+      // mutation flush. Cheap: applyButtonBusyState early-returns on no-op.
+      sweepStreamingDisableState();
+    }
+  }
+
+  function transcriptActionRecordSummary(record) {
+    if (!record) return null;
+    return {
+      uuid: record.uuid || null,
+      betaMessageId: record.betaMessageId || null,
+      type: record.type || null,
+      hasText: transcriptHasText(record),
+      partial: transcriptRecordHasPartialContent(record),
+      lastAssistant: record.type === 'assistant' ? isLastAssistantOfTurn(record) : false,
+      textTail: transcriptText(record).slice(-120),
+    };
+  }
+
+  function diagnoseTranscriptActions() {
+    const fallbackRecord = lastAssistantTextRecordOfTurn();
+    const fallbackRoot = fallbackRecord && lastAssistantMarkdownRoot(fallbackRecord);
+    const host = fallbackRoot && findAssistantActionHost(fallbackRoot);
+    const domRecord = host
+      ? (transcriptRecordForElement(host) || transcriptRecordForElement(fallbackRoot))
+      : null;
+    const session = locateActiveSessionState();
+    const messages = session && session.messages && session.messages.value;
+    const tail = Array.isArray(messages)
+      ? messages.slice(-8).map(m => transcriptActionRecordSummary(m))
+      : null;
+    return {
+      busy: conversationIsBusy(),
+      sessionBusy: activeSessionBusyState(),
+      sendButtonState: sendButtonDomState(),
+      partialTail: activeSessionHasPartialTail(),
+      quietFor: Math.round(nowMs() - lastTranscriptMutationAt),
+      markdownRoots: document.querySelectorAll(SEL.markdownRoot).length,
+      fallbackRecord: transcriptActionRecordSummary(fallbackRecord),
+      fallbackRoot: fallbackRoot ? {
+        textTail: (fallbackRoot.textContent || '').slice(-160),
+        hasHost: !!host,
+        hasExistingRow: !!(host && host.querySelector(':scope > .incipit-assistant-action-row')),
+      } : null,
+      domRecord: transcriptActionRecordSummary(domRecord),
+      tail,
+    };
+  }
+
+  function setupTranscriptActionDebugTools() {
+    try {
+      window.__incipitTranscriptActions = {
+        rescan: () => scanAssistantTranscriptActions(document.body),
+        diagnose: diagnoseTranscriptActions,
+      };
+    } catch (_) {}
+  }
+
+  // ========== 8b. permission indicator softening ==========
+  //
+  // Class names for bypass and danger indicators vary across versions.
+  // Text scanning provides a fallback by tagging small leaf nodes whose text
+  // contains bypass or danger markers.
+  const DANGER_TEXT_RE = /\b(bypass\s+permissions?|yolo\s*mode|dangerous(?:ly)?)\b/i;
+
+  // Shared accent color for softened danger indicators.
+  const CLAUDE_CORAL = '#d97757';
+  const CLAUDE_CORAL_BG = 'rgba(217,119,87,0.10)';
+  const CLAUDE_CORAL_BORDER = 'rgba(217,119,87,0.45)';
+
+  function applyCoralStyle(el) {
+    // Change only foreground-related properties. Some containers carry danger
+    // classes on large surfaces and should keep their background fill.
+    el.style.setProperty('color', CLAUDE_CORAL, 'important');
+    el.style.setProperty('border-color', CLAUDE_CORAL_BORDER, 'important');
+    el.style.setProperty('fill', CLAUDE_CORAL, 'important');
+  }
+
+  let _lastSoftenAt = 0;
+  function softenDangerIndicators() {
+    // Throttle to 1.2s.
+    const now = performance.now();
+    if (now - _lastSoftenAt < 1200) return;
+    _lastSoftenAt = now;
+
+    // 1) direct class-based matches
+    const classSelectors = [
+      '[class*="bypassPermission" i]',
+      '[class*="bypass-permission" i]',
+      '[class*="permissionMode" i]',
+      '[class*="permission-mode" i]',
+      '[class*="dangerMode" i]',
+      '[class*="yoloMode" i]',
+      '[class*="dangerous" i]',
+    ];
+    for (const sel of classSelectors) {
+      try {
+        for (const el of document.querySelectorAll(sel)) {
+          if (el.hasAttribute('data-claude-softened')) continue;
+          el.setAttribute('data-claude-softened', '1');
+          applyCoralStyle(el);
+        }
+      } catch { /* invalid selector on old chromium */ }
+    }
+
+    // 2) text-scan fallback, narrowly scoped to the chrome surfaces where
+    //    bypass / danger indicators actually live (footer and header regions).
+    //    The previous version scanned every `div,span,button,a,li` in the
+    //    document, which was O(DOM) on every call.
+    const scopes = [];
+    for (const s of document.querySelectorAll(SEL.inputFooter)) scopes.push(s);
+    for (const s of document.querySelectorAll(SEL.stickyMessage)) scopes.push(s);
+    for (const scope of scopes) {
+      const candidates = scope.querySelectorAll('div, span, button, a, li');
+      for (const el of candidates) {
+        if (el.hasAttribute('data-claude-softened')) continue;
+        if (el.children.length > 5) continue;
+        const text = (el.textContent || '').trim();
+        if (text.length === 0 || text.length > 80) continue;
+        if (DANGER_TEXT_RE.test(text)) {
+          el.setAttribute('data-claude-softened', '1');
+          applyCoralStyle(el);
+        }
+      }
+    }
+  }
+
+  // ========== 9. bootstrap-owned surfaces ==========
+  //
+  // theme.css / warm-white CSS, VS Code app-var overrides, bodyBold, host_probe,
+  // DOM freeze, and DOM-ready scheduling live in enhance_shared.js +
+  // claude_code_enhance.js. Do not reintroduce those boot responsibilities here.
+
+  // ========== 11. thinking ==========
+  // Moved to enhance_thinking.js and loaded by the bootstrap scheduler.
+
+  // ========== 12. init ==========
+
+
+  // ============================================================
+  // Diff side bars.
+  // ============================================================
+  //
+  // Monaco's side-by-side diff layout becomes unusual once line numbers are
+  // enabled: the original editor can collapse into a narrow line-number gutter
+  // while the modified editor owns the visible inline code. Decorations placed
+  // on either Monaco gutter then no longer line up with the rows the user is
+  // reading. Draw the left rule ourselves instead: read the visible changed
+  // rows from Monaco's overlay layer, project their client rects onto the diff root,
+  // and place a 3px overlay at the far left.
+  //
+  // FRAGILITY NOTE: this uses Monaco's stable-ish DOM class names
+  // (`monaco-diff-editor`, `.view-overlays`, `.line-insert/.line-delete`).
+  // If Monaco changes those internals, the fallback is simply "no side rule";
+  // syntax colours, line numbers, and diff bands still come from Monaco.
+  const DIFF_EDITOR_SELECTOR =
+    ':is([class*="diffEditorWrapper"], [class*="modalContent_"]) .monaco-diff-editor';
+
+  let diffBarsRaf = 0;
+  let diffInfoSeq = 0;
+  let activeModalDiffInfoKey = '';
+  const diffLineInfoByKey = new Map();
+  const diffLineInfoByRequest = new Map();
+  const diffLineInfoFileKey = new Map();
+  let diffLineInfoListenerBound = false;
+
+  // Track currently-mounted diff editors so we can do zero work when none
+  // exist. Without this gate, every body-subtree childList mutation and every
+  // capture-phase scroll event in the document — including the per-frame
+  // auto-scroll of `messagesContainer` during streaming — triggered an rAF
+  // followed by `document.querySelectorAll(DIFF_EDITOR_SELECTOR)`. Sessions
+  // that never open an Edit/Write/MultiEdit tool paid that cost continuously.
+  const liveDiffEditors = new Set();
+  let diffSideBarsListenersBound = false;
+  // Looser predicate than `DIFF_EDITOR_SELECTOR`: matches a wrapper even
+  // before Monaco has mounted its `.monaco-diff-editor` inside, plus the
+  // editor itself (covers the lazy-mount race). False positives — e.g. a
+  // non-diff modal — only cost one extra `refreshLiveDiffEditors()` call,
+  // which then finds nothing and leaves the set empty.
+  const DIFF_TOUCH_SELECTOR =
+    '[class*="diffEditorWrapper"], [class*="modalContent_"], .monaco-diff-editor';
+
+  function nodeTouchesDiff(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (node.matches?.(DIFF_TOUCH_SELECTOR)) return true;
+    return node.querySelector?.(DIFF_TOUCH_SELECTOR) != null;
+  }
+
+  function refreshLiveDiffEditors() {
+    liveDiffEditors.clear();
+    document.querySelectorAll(DIFF_EDITOR_SELECTOR).forEach(el => liveDiffEditors.add(el));
+    syncDiffSideBarsListeners();
+  }
+
+  function syncDiffSideBarsListeners() {
+    const want = liveDiffEditors.size > 0;
+    if (want === diffSideBarsListenersBound) return;
+    diffSideBarsListenersBound = want;
+    if (want) {
+      // Capture-phase: catches Monaco's internal scrollable as well as any
+      // ancestor scroller that affects the diff's viewport position.
+      document.addEventListener('scroll', scheduleDiffSideBars, true);
+      window.addEventListener('resize', scheduleDiffSideBars);
+    } else {
+      document.removeEventListener('scroll', scheduleDiffSideBars, true);
+      window.removeEventListener('resize', scheduleDiffSideBars);
+    }
+  }
+
+  function scheduleDiffSideBars() {
+    if (diffBarsRaf) return;
+    if (liveDiffEditors.size === 0) return;
+    diffBarsRaf = requestAnimationFrame(() => {
+      diffBarsRaf = 0;
+      syncAllDiffSideBars();
+    });
+  }
+
+  function ensureDiffBarsLayer(diff) {
+    let layer = diff.querySelector(':scope > [data-incipit-diff-bars]');
+    if (!layer) {
+      layer = document.createElement('div');
+      layer.setAttribute('data-incipit-diff-bars', '');
+      diff.appendChild(layer);
+    }
+    return layer;
+  }
+
+  function roundRectPx(value) {
+    return Math.round(value * 10) / 10;
+  }
+
+  function diffPositiveLineNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+  }
+
+  function reactFiberForElement(el) {
+    if (!el) return null;
+    const fk = Object.keys(el).find(k => k.startsWith('__reactFiber'));
+    return fk ? el[fk] : null;
+  }
+
+  function readRenderedDiffPayload(wrapper) {
+    let f = reactFiberForElement(wrapper);
+    for (let i = 0; i < 30 && f; i++) {
+      const p = f.memoizedProps;
+      if (p && typeof p.original === 'string' && typeof p.modified === 'string') {
+        return {
+          filePath: typeof p.filePath === 'string' ? p.filePath : '',
+          oldText: p.original,
+          newText: p.modified,
+          source: 'rendered',
+        };
+      }
+      f = f.return;
+    }
+    return null;
+  }
+
+  function firstEditPayload(input) {
+    if (!input || typeof input !== 'object') return null;
+    if (typeof input.old_string === 'string' || typeof input.new_string === 'string') {
+      return {
+        oldText: typeof input.old_string === 'string' ? input.old_string : '',
+        newText: typeof input.new_string === 'string' ? input.new_string : '',
+      };
+    }
+    const edits = Array.isArray(input.edits) ? input.edits : [];
+    for (const edit of edits) {
+      if (!edit || typeof edit !== 'object') continue;
+      if (typeof edit.old_string === 'string' || typeof edit.new_string === 'string') {
+        return {
+          oldText: typeof edit.old_string === 'string' ? edit.old_string : '',
+          newText: typeof edit.new_string === 'string' ? edit.new_string : '',
+        };
+      }
+    }
+    return null;
+  }
+
+  function writeDiffPayload(block) {
+    const input = block && block.input;
+    if (!input || typeof input !== 'object') return null;
+    if (block.name !== 'Write') return null;
+    if (typeof input.content !== 'string') return null;
+    const filePath = typeof input.file_path === 'string' ? input.file_path : '';
+    if (!filePath) return null;
+    return {
+      filePath,
+      oldText: '',
+      newText: input.content,
+      source: 'write-input',
+    };
+  }
+
+  function editDiffPayload(block) {
+    const input = block && block.input;
+    if (!input || typeof input !== 'object') return null;
+    if (block.name !== 'Edit' && block.name !== 'MultiEdit') return null;
+    const filePath = typeof input.file_path === 'string' ? input.file_path : '';
+    if (!filePath) return null;
+    // MultiEdit normally carries an `edits[]` list of independent replacements.
+    // Rendering only the first hunk would be misleading, so keep that host path
+    // until we build a multi-hunk island. The direct old/new shape is safe.
+    if (block.name === 'MultiEdit' &&
+        (typeof input.old_string !== 'string' && typeof input.new_string !== 'string')) {
+      return null;
+    }
+    const edit = firstEditPayload(input);
+    if (!edit) return null;
+    return {
+      filePath,
+      oldText: edit.oldText,
+      newText: edit.newText,
+      source: block.name === 'MultiEdit' ? 'multiedit-input' : 'edit-input',
+    };
+  }
+
+  function incipitDiffPayload(block) {
+    return writeDiffPayload(block) || editDiffPayload(block);
+  }
+
+  function fallbackDiffPayload(block) {
+    const input = block && block.input;
+    if (!input || typeof input !== 'object') return null;
+    const filePath = typeof input.file_path === 'string' ? input.file_path : '';
+    if (!filePath) return null;
+    const owned = incipitDiffPayload(block);
+    if (owned) return owned;
+    const edit = firstEditPayload(input);
+    if (!edit) return null;
+    return {
+      filePath,
+      oldText: edit.oldText,
+      newText: edit.newText,
+      source: 'tool-input',
+    };
+  }
+
+  function diffLineInfoPayload(wrapper, block) {
+    const rendered = readRenderedDiffPayload(wrapper);
+    const fallback = fallbackDiffPayload(block);
+    if (rendered && (rendered.oldText || rendered.newText)) {
+      if (!rendered.filePath && fallback && fallback.filePath) rendered.filePath = fallback.filePath;
+      if (rendered.filePath) return rendered;
+    }
+    return fallback;
+  }
+
+  function diffLineInfoFileKeyVariants(filePath) {
+    const raw = String(filePath || '').trim();
+    if (!raw) return [];
+    const slash = raw.replace(/\\/g, '/');
+    const lowerSlash = slash.toLowerCase();
+    const out = [raw, slash, lowerSlash];
+    return out.filter((v, i) => v && out.indexOf(v) === i);
+  }
+
+  function rememberDiffLineInfoFileKey(filePath, key) {
+    diffLineInfoFileKeyVariants(filePath).forEach(k => diffLineInfoFileKey.set(k, key));
+  }
+
+  function lookupDiffLineInfoFileKey(filePath) {
+    for (const k of diffLineInfoFileKeyVariants(filePath)) {
+      const key = diffLineInfoFileKey.get(k);
+      if (key) return key;
+    }
+    return '';
+  }
+
+  function getIncipitVsCodeApi() {
+    try {
+      if (typeof globalThis.__incipitGetVsCodeApi === 'function') {
+        return globalThis.__incipitGetVsCodeApi();
+      }
+      if (typeof acquireVsCodeApi === 'function') return acquireVsCodeApi();
+    } catch (_) {}
+    return null;
+  }
+
+  function hashStringForKey(value) {
+    const s = String(value || '');
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(36);
+  }
+
+  function diffLineInfoKey(payload) {
+    if (!payload || !payload.filePath) return '';
+    const oldText = typeof payload.oldText === 'string' ? payload.oldText : '';
+    const newText = typeof payload.newText === 'string' ? payload.newText : '';
+    return [
+      payload.filePath,
+      oldText.length,
+      hashStringForKey(oldText),
+      newText.length,
+      hashStringForKey(newText),
+    ].join('|');
+  }
+
+  function setupDiffLineInfoChannel() {
+    if (diffLineInfoListenerBound) return;
+    diffLineInfoListenerBound = true;
+    window.addEventListener('message', evt => {
+      const msg = evt && evt.data;
+      if (!msg || msg.__incipit !== true || msg.type !== 'diff_line_info_response') return;
+      const key = diffLineInfoByRequest.get(msg.requestId);
+      if (!key) return;
+      diffLineInfoByRequest.delete(msg.requestId);
+      const current = diffLineInfoByKey.get(key) || {};
+      const payload = msg.payload || {};
+      diffLineInfoByKey.set(key, {
+        ...current,
+        status: payload && !payload.error ? 'ready' : 'error',
+        oldStartLine: diffPositiveLineNumber(payload.oldStartLine),
+        newStartLine: diffPositiveLineNumber(payload.newStartLine),
+        startLine: diffPositiveLineNumber(payload.startLine),
+      });
+      scheduleDiffSideBars();
+      try {
+        document.querySelectorAll('[data-incipit-diff-island]').forEach(node => {
+          if (node.dataset && node.dataset.incipitDiffLineInfoKey === key) {
+            enqueueAffectedToolUses(node);
+          }
+        });
+        if (pendingToolUseRoots.size) scheduleRescan();
+      } catch (_) { /* best-effort line number refresh */ }
+    });
+  }
+
+  function ensureDiffLineInfo(wrapper, block) {
+    const payload = diffLineInfoPayload(wrapper, block);
+    const key = diffLineInfoKey(payload);
+    if (!key || !wrapper) return '';
+    wrapper.dataset.incipitDiffLineInfoKey = key;
+    const filePath = payload.filePath;
+    if (filePath) rememberDiffLineInfoFileKey(filePath, key);
+
+    const cached = diffLineInfoByKey.get(key);
+    if (cached && cached.status) return key;
+
+    const api = getIncipitVsCodeApi();
+    if (!api || typeof api.postMessage !== 'function') {
+      diffLineInfoByKey.set(key, { status: 'unavailable' });
+      return key;
+    }
+
+    const requestId = 'diff-' + (++diffInfoSeq).toString(36);
+    diffLineInfoByRequest.set(requestId, key);
+    diffLineInfoByKey.set(key, { status: 'pending' });
+    try {
+      api.postMessage({
+        __incipit: true,
+        type: 'diff_line_info_request',
+        requestId,
+        filePath,
+        oldText: typeof payload.oldText === 'string' ? payload.oldText : '',
+        newText: typeof payload.newText === 'string' ? payload.newText : '',
+      });
+    } catch (_) {
+      diffLineInfoByRequest.delete(requestId);
+      diffLineInfoByKey.set(key, { status: 'error' });
+    }
+    return key;
+  }
+
+  function bindDiffModalKeyCapture(wrapper, key) {
+    if (!wrapper || !key || wrapper.dataset.incipitDiffModalKeyBound === '1') return;
+    wrapper.addEventListener('click', evt => {
+      const target = evt.target;
+      if (target && target.closest && target.closest('[class*="clickOverlay"]')) {
+        activeModalDiffInfoKey = key;
+        scheduleDiffSideBars();
+      }
+    }, true);
+    wrapper.dataset.incipitDiffModalKeyBound = '1';
+  }
+
+  function diffLineInfoForEditor(diff) {
+    const shell = diff.closest('[class*="diffEditorWrapper"], [class*="modalContent_"]');
+    let key = shell && shell.dataset ? shell.dataset.incipitDiffLineInfoKey : '';
+    if (!key && shell && shell.matches && shell.matches('[class*="modalContent_"]')) {
+      key = activeModalDiffInfoKey;
+      const title = shell.querySelector('[class*="modalTitle_"]');
+      const filePath = title && title.textContent ? title.textContent.trim() : '';
+      if (!key && filePath) key = lookupDiffLineInfoFileKey(filePath);
+    }
+    return key ? (diffLineInfoByKey.get(key) || null) : null;
+  }
+
+  function collectDiffBarSegments(diff) {
+    const rows = diff.querySelectorAll(
+      '.view-overlays .line-delete, .view-overlays .line-insert'
+    );
+    if (!rows.length) return [];
+
+    const rootRect = diff.getBoundingClientRect();
+    if (rootRect.width <= 0 || rootRect.height <= 0) return [];
+
+    const segments = [];
+    rows.forEach(row => {
+      const type = row.classList.contains('line-insert') ? 'add'
+        : row.classList.contains('line-delete') ? 'del'
+        : '';
+      if (!type) return;
+      const rect = row.getBoundingClientRect();
+      if (rect.height <= 0 || rect.bottom <= rootRect.top || rect.top >= rootRect.bottom) return;
+      const top = Math.max(0, rect.top - rootRect.top);
+      const bottom = Math.min(rootRect.height, rect.bottom - rootRect.top);
+      if (bottom - top < 1) return;
+      segments.push({
+        type,
+        top: roundRectPx(top),
+        bottom: roundRectPx(bottom),
+      });
+    });
+
+    segments.sort((a, b) => a.top - b.top || a.bottom - b.bottom || a.type.localeCompare(b.type));
+
+    const merged = [];
+    for (const seg of segments) {
+      const prev = merged[merged.length - 1];
+      if (prev && prev.type === seg.type && seg.top <= prev.bottom + 1.5) {
+        prev.bottom = Math.max(prev.bottom, seg.bottom);
+      } else {
+        merged.push({ ...seg });
+      }
+    }
+    return merged;
+  }
+
+  function collectDiffLineNumbers(diff, info) {
+    if (!info || info.status !== 'ready') return [];
+    const oldStart = diffPositiveLineNumber(info.oldStartLine || info.startLine);
+    const newStart = diffPositiveLineNumber(info.newStartLine || info.startLine);
+    if (!oldStart && !newStart) return [];
+    const rootRect = diff.getBoundingClientRect();
+    if (rootRect.width <= 0 || rootRect.height <= 0) return [];
+
+    const rows = [];
+    const addRows = (selector, startLine, source) => {
+      diff.querySelectorAll(selector).forEach(node => {
+        const raw = (node.textContent || '').trim();
+        const n = diffPositiveLineNumber(raw);
+        if (!n) return;
+        const rect = node.getBoundingClientRect();
+        if (rect.height <= 0 || rect.bottom <= rootRect.top || rect.top >= rootRect.bottom) return;
+        rows.push({
+          source,
+          top: roundRectPx(Math.max(0, rect.top - rootRect.top)),
+          height: roundRectPx(Math.min(rootRect.height, rect.bottom - rootRect.top) - Math.max(0, rect.top - rootRect.top)),
+          line: startLine + n - 1,
+        });
+      });
+    };
+
+    addRows('.editor.original .line-numbers', oldStart || newStart, 'old');
+    addRows('.editor.modified .line-numbers', newStart || oldStart, 'new');
+
+    rows.sort((a, b) => a.top - b.top || (a.source === 'new' ? -1 : 1));
+    const out = [];
+    for (const row of rows) {
+      const prev = out[out.length - 1];
+      if (prev && Math.abs(prev.top - row.top) < 1.5) {
+        // Prefer the modified-side number when both sides render a number at
+        // the same visual row; the visible code is shifted into that column.
+        if (row.source === 'new') {
+          prev.line = row.line;
+          prev.height = row.height || prev.height;
+        }
+        continue;
+      }
+      out.push(row);
+    }
+    return out;
+  }
+
+  function ensureDiffLineNumbersLayer(diff) {
+    let layer = diff.querySelector(':scope > [data-incipit-diff-line-numbers]');
+    if (!layer) {
+      layer = document.createElement('div');
+      layer.setAttribute('data-incipit-diff-line-numbers', '');
+      diff.appendChild(layer);
+    }
+    return layer;
+  }
+
+  function syncOneDiffSideBars(diff) {
+    const layer = ensureDiffBarsLayer(diff);
+    const segments = collectDiffBarSegments(diff);
+    const barsSignature = segments
+      .map(seg => seg.type + ':' + seg.top + ':' + (seg.bottom - seg.top))
+      .join('|');
+
+    if (layer.dataset.incipitDiffBarsSig !== barsSignature) {
+      layer.dataset.incipitDiffBarsSig = barsSignature;
+      while (layer.firstChild) layer.removeChild(layer.firstChild);
+      for (const seg of segments) {
+        const bar = document.createElement('div');
+        bar.setAttribute('data-incipit-diff-bar', seg.type);
+        bar.style.top = seg.top + 'px';
+        bar.style.height = Math.max(2, seg.bottom - seg.top) + 'px';
+        layer.appendChild(bar);
+      }
+    }
+
+    const numsLayer = ensureDiffLineNumbersLayer(diff);
+    const nums = collectDiffLineNumbers(diff, diffLineInfoForEditor(diff));
+    for (const item of nums) {
+      const mid = item.top + (item.height / 2);
+      const hit = segments.find(seg => mid >= seg.top - 1 && mid <= seg.bottom + 1);
+      item.kind = hit ? hit.type : '';
+    }
+    const numsSignature = nums.map(n => n.top + ':' + n.height + ':' + n.line + ':' + n.kind).join('|');
+    if (numsLayer.dataset.incipitDiffLineNumsSig !== numsSignature) {
+      numsLayer.dataset.incipitDiffLineNumsSig = numsSignature;
+      while (numsLayer.firstChild) numsLayer.removeChild(numsLayer.firstChild);
+      for (const item of nums) {
+        const n = document.createElement('div');
+        n.setAttribute('data-incipit-diff-line-number', item.kind || '');
+        n.style.top = item.top + 'px';
+        n.style.height = Math.max(1, item.height) + 'px';
+        n.textContent = String(item.line);
+        numsLayer.appendChild(n);
+      }
+    }
+  }
+
+  function syncAllDiffSideBars() {
+    // Iterate the tracked set; lazily evict disconnected nodes (modal close,
+    // toolUse remount). When the set drains we tear down the global scroll
+    // and resize listeners so no further work is dispatched.
+    for (const diff of Array.from(liveDiffEditors)) {
+      if (!diff.isConnected) {
+        liveDiffEditors.delete(diff);
+        continue;
+      }
+      syncOneDiffSideBars(diff);
+    }
+    if (liveDiffEditors.size === 0) syncDiffSideBarsListeners();
+  }
+
+  function setupDiffSideBars() {
+    setupDiffLineInfoChannel();
+    refreshLiveDiffEditors();
+    scheduleDiffSideBars();
+
+    // Body-subtree childList still has to be observed so that we notice when
+    // a diff editor mounts (Edit/Write tool call streams in) or unmounts
+    // (modal close, fold collapse). Critically, we now FILTER the mutations:
+    // schedule + refresh only when the mutation actually touches a diff
+    // wrapper / `.monaco-diff-editor`. Streaming text mutations no longer
+    // trigger an rAF + global QSA on every frame.
+    const mo = new MutationObserver(muts => {
+      let touched = false;
+      for (let i = 0; i < muts.length && !touched; i++) {
+        const m = muts[i];
+        if (m.type !== 'childList') continue;
+        for (let j = 0; j < m.addedNodes.length; j++) {
+          if (nodeTouchesDiff(m.addedNodes[j])) { touched = true; break; }
+        }
+        if (touched) break;
+        for (let j = 0; j < m.removedNodes.length; j++) {
+          if (nodeTouchesDiff(m.removedNodes[j])) { touched = true; break; }
+        }
+      }
+      if (touched) {
+        refreshLiveDiffEditors();
+        scheduleDiffSideBars();
+      }
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ============================================================
+  // Tool-use fold.
+  // ============================================================
+  //
+  // Each `[class*="toolUse_"]` element holds one tool-call block. Claude
+  // Code renders these fully expanded by default — for a long conversation
+  // with many Edits, the diff editors eat the whole transcript viewport.
+  //
+  // We pierce React fiber to read the underlying `tool_use` block:
+  //   { type: 'tool_use', name: 'Edit', input: { old_string, new_string, ... } }
+  // and compute precise `+added / -removed` line counts via line-level LCS.
+  // Then we:
+  //   1. inject a `<span data-incipit-tool-stats>+N −M ▸</span>` at the end
+  //      of the tool summary row (stats only for Edit/MultiEdit/Write),
+  //   2. default-collapse the body via `data-incipit-tool-collapsed="true"`,
+  //   3. hide the host `secondaryLine` ("Modified" / "Added 1 line") only
+  //      when we provided our own stats — non-Edit/Write tools keep their
+  //      host-provided fingerprint because we have nothing better to say.
+  //
+  // The fiber walk is bounded (10 levels up) and the LCS DP is capped at
+  // 500k cell-products (roughly 700×700 lines) before falling back to a
+  // length-delta approximation, so pathological Edit sizes cannot stall
+  // the render.
+  //
+  // FRAGILITY NOTE — this is the only place in the project that reads
+  // React's internal bookkeeping (`__reactFiber*` / `memoizedProps`). Every
+  // other module (host_probe, math gate, thinking, badge, input avoidance)
+  // stays on CSS module prefixes + DOM structure, which survives Claude
+  // Code's minor version bumps. Fiber pierce does not have that guarantee:
+  // a React major upgrade could rename the DOM key (historical precedent:
+  // 16→17 `__reactInternalInstance` → `__reactFiber$`), and a bundler /
+  // component refactor inside Claude Code could reshape `memoizedProps`
+  // into something `readToolUseBlock` no longer recognises. We mitigate
+  // with a dual-shape unwrap (accepts both `p.content.type` and
+  // `p.content.content.type`) and a null-early-return, so the failure mode
+  // is "tool-fold silently disabled, host renders natively" rather than a
+  // half-broken UI — but if this function ever stops decorating anything,
+  // the first suspect is a fiber shape drift, not a CSS selector miss.
+  function setupToolFold() {
+    // Animated expand / collapse for the tool body. Drives the transition
+    // by writing `inline max-height` from `scrollHeight` so the curve runs
+    // the full natural distance — a fixed CSS `max-height` cap would let
+    // short bodies feel instantaneous and clip long ones. The resting CSS
+    // rule (`max-height: 0` while collapsed) takes over after the
+    // `transitionend` clears the inline value.
+    //
+    // Constant-speed timing: instead of a fixed duration, duration scales
+    // with the distance traveled (px / FOLD_SPEED_PX_PER_S), clamped into
+    // [FOLD_MIN_DUR_MS, FOLD_MAX_DUR_MS]. This gives every fold a uniform
+    // visual velocity — short Read-summary bodies don't drag, long Edit
+    // diffs don't fly past the eye in 220 ms.
+    const FOLD_SPEED_PX_PER_S = 900;
+    const FOLD_MIN_DUR_MS = 160;
+    const FOLD_MAX_DUR_MS = 950;
+    function foldDuration(distance) {
+      const ms = (Math.abs(distance) / FOLD_SPEED_PX_PER_S) * 1000;
+      return Math.max(FOLD_MIN_DUR_MS, Math.min(FOLD_MAX_DUR_MS, ms));
+    }
+
+    function cancelFoldAnimation(target) {
+      if (!target) return;
+      if (target.__incipitFoldTimer) {
+        clearTimeout(target.__incipitFoldTimer);
+        target.__incipitFoldTimer = 0;
+      }
+      if (target.__incipitFoldRaf) {
+        cancelAnimationFrame(target.__incipitFoldRaf);
+        target.__incipitFoldRaf = 0;
+      }
+      if (target.__incipitFoldEnd) {
+        target.removeEventListener('transitionend', target.__incipitFoldEnd);
+        target.__incipitFoldEnd = null;
+      }
+    }
+
+    function clearFoldInline(target) {
+      cancelFoldAnimation(target);
+      target.style.maxHeight = '';
+      target.style.transitionDuration = '';
+    }
+
+    function armFoldCleanup(target, durationMs) {
+      function onEnd(e) {
+        if (e.target !== target || e.propertyName !== 'max-height') return;
+        cleanup();
+      }
+      function cleanup() {
+        if (target.__incipitFoldEnd !== onEnd) return;
+        if (target.__incipitFoldTimer) {
+          clearTimeout(target.__incipitFoldTimer);
+          target.__incipitFoldTimer = 0;
+        }
+        target.removeEventListener('transitionend', onEnd);
+        target.__incipitFoldEnd = null;
+        target.style.maxHeight = '';
+        target.style.transitionDuration = '';
+      }
+
+      target.__incipitFoldEnd = onEnd;
+      target.addEventListener('transitionend', onEnd);
+      // `transitionend` is not guaranteed: target height can measure as 0
+      // while Monaco is still laying out, the element can detach mid-flight,
+      // or the browser can coalesce the start/end values. The timeout makes
+      // the failure posture "fail open" instead of leaving max-height:0.
+      target.__incipitFoldTimer = setTimeout(cleanup, durationMs + 120);
+    }
+
+    function foldTargetHeight(target) {
+      const rectHeight = target.getBoundingClientRect ? target.getBoundingClientRect().height : 0;
+      return Math.max(target.scrollHeight || 0, Math.ceil(rectHeight || 0));
+    }
+
+    function scheduleFoldLayoutRefresh(targets) {
+      const needsRefresh = targets.some(t => (
+        t && t.querySelector &&
+        t.querySelector('[class*="diffEditorContainer"], .monaco-diff-editor, .monaco-editor')
+      ));
+      if (!needsRefresh) return;
+
+      // Monaco can be created while the host body was display:none (the host
+      // hides tool bodies below 500px). Once incipit reveals the body, nudge
+      // Monaco's automaticLayout / ResizeObserver path over two frames.
+      requestAnimationFrame(() => {
+        try { window.dispatchEvent(new Event('resize')); } catch (_) {}
+        requestAnimationFrame(() => {
+          try { window.dispatchEvent(new Event('resize')); } catch (_) {}
+        });
+      });
+    }
+
+    function animateExpandTargets(el, targets) {
+      targets = targets.filter(Boolean);
+      if (!targets.length) {
+        el.dataset.incipitToolCollapsed = 'false';
+        return;
+      }
+
+      // Pin every target at 0 first, then flip the attr so CSS switches the
+      // row label/chevron state before measuring the open layout.
+      targets.forEach(t => {
+        cancelFoldAnimation(t);
+        t.style.transitionDuration = '0ms';
+        t.style.maxHeight = '0px';
+      });
+      el.dataset.incipitToolCollapsed = 'false';
+      targets.forEach(t => { void t.offsetHeight; });
+      scheduleFoldLayoutRefresh(targets);
+
+      targets.forEach(t => {
+        const target = foldTargetHeight(t);
+        if (target <= 0) {
+          // Monaco diff editors can finish their internal layout only after
+          // the body becomes visible. If the first measurement is 0, clearing
+          // the inline clamp is safer than animating 0 -> 0 and trapping the
+          // eventual editor behind max-height:0.
+          clearFoldInline(t);
+          return;
+        }
+        const duration = foldDuration(target);
+        t.style.transitionDuration = duration + 'ms';
+        t.style.maxHeight = target + 'px';
+        armFoldCleanup(t, duration);
+      });
+    }
+
+    function animateCollapseTargets(el, targets) {
+      targets = targets.filter(Boolean);
+      if (!targets.length) {
+        el.dataset.incipitToolCollapsed = 'true';
+        return;
+      }
+
+      const starts = targets.map(foldTargetHeight);
+      targets.forEach((t, i) => {
+        cancelFoldAnimation(t);
+        const start = starts[i];
+        if (start > 0) {
+          t.style.transitionDuration = foldDuration(start) + 'ms';
+          t.style.maxHeight = start + 'px';
+        }
+      });
+      el.dataset.incipitToolCollapsed = 'true';
+
+      targets.forEach((t, i) => {
+        const start = starts[i];
+        if (start <= 0) {
+          clearFoldInline(t);
+          return;
+        }
+        const duration = foldDuration(start);
+        void t.offsetHeight;
+        t.style.maxHeight = '0px';
+        armFoldCleanup(t, duration);
+      });
+    }
+
+    function animateExpandBody(el, body) {
+      animateExpandTargets(el, [body]);
+    }
+
+    function animateCollapseBody(el, body) {
+      animateCollapseTargets(el, [body]);
+    }
+
+    // First-time collapse without the flash. CSS gives toolBody (and
+    // grep expansion) a default `max-height` transition so click
+    // toggles animate. But the very first time we set
+    // `data-incipit-tool-collapsed='true'` (right after stream finishes
+    // filling the body), the body's resting max-height is `none` and
+    // Chromium does interpolate `none → 0` by treating `none` as the
+    // current scrollHeight — visible as the tool flashing fully open
+    // and then snapping shut. Inline `transition: none` + force-reflow
+    // + rAF restore makes the initial snap instant, leaving the click
+    // animation rule untouched. Older comment claimed Chromium does
+    // not interpolate this case; that turned out to be wrong in
+    // practice.
+    function snapInitialCollapse(el) {
+      const targets = [];
+      const tb = el.querySelector('[class*="toolBody_"]');
+      if (tb) targets.push(tb);
+      const exp = el.querySelector('[data-incipit-tool-grep-expansion]');
+      if (exp) targets.push(exp);
+      const prevs = targets.map(t => t.style.transition);
+      targets.forEach(t => {
+        clearFoldInline(t);
+        t.style.transition = 'none';
+      });
+      el.dataset.incipitToolCollapsed = 'true';
+      // Force a synchronous layout pass so the no-transition collapse
+      // commits before we restore the CSS-driven transition next frame.
+      if (targets.length) void targets[0].offsetHeight;
+      requestAnimationFrame(() => {
+        targets.forEach((t, i) => { t.style.transition = prevs[i] || ''; });
+      });
+    }
+
+    // Reads the tool_result block paired with a given tool_use, by
+    // pulling it off Claude Code's Preact Signal. Host wraps each
+    // tool-call entry in a synthetic prop object whose two relevant
+    // fields are:
+    //   memoizedProps.content.content           — the tool_use block
+    //   memoizedProps.content.toolResultSignal  — Preact Signal whose
+    //                                             .peek() returns the
+    //                                             tool_result block
+    // The signal lives on the SAME fiber that renders the tool_use, so
+    // we walk fiber.return up until we hit a fiber whose
+    // memoizedProps.content has a toolResultSignal field, then peek it.
+    //
+    // Why .peek() not .value: .value subscribes the current React
+    // render scope to the signal (Preact Signals integration). We're
+    // reading from event handlers and decorate passes, NOT from a
+    // render — subscribing here would either no-op (no scope) or in
+    // worst case wire up a dangling subscription. .peek() reads the
+    // current value with zero side effects.
+    //
+    // Fragility: depends on (a) fiber prop shape (`content.content` +
+    // `content.toolResultSignal`), (b) Preact Signals API (.peek). If
+    // host migrates off Preact Signals, swap to whatever new mechanism
+    // they use — the fiber walk + outer prop name `content` are the
+    // stable parts. See `__incipitDumpFiber` for diagnostic dumping.
+    const _toolResultDiagSeen = new Set();
+
+    // Manual fiber-tree DFS dumper. Call from webview Devtools console:
+    //   __incipitDumpFiber()              — uses last [data-incipit-tool-use]
+    //   __incipitDumpFiber(domEl)         — uses given element
+    // Walks fiber.return up to the root, then DFS down via child/sibling
+    // (no `return` traversal — that would create cycles). Records every
+    // memoizedProps key whose value either *is* a content block or is an
+    // array containing content blocks, regardless of the key name. The
+    // goal is to find where tool_result lives — fiber.return walk from
+    // toolUse missed it, so the value must be reachable only from the
+    // root downward (e.g. a ConversationView store-driven prop, or a
+    // sibling subtree we never visited).
+    window.__incipitDumpFiber = function (target) {
+      let el = target;
+      if (!el) {
+        const all = document.querySelectorAll('[data-incipit-tool-use]');
+        el = all[all.length - 1];
+        if (!el) { console.warn('[incipit dump] no [data-incipit-tool-use] found'); return; }
+      }
+      const fk = Object.keys(el).find(k => k.startsWith('__reactFiber'));
+      if (!fk) { console.warn('[incipit dump] no __reactFiber* key on element'); return; }
+
+      let f = el[fk];
+      let upDepth = 0;
+      while (f.return) { f = f.return; upDepth++; }
+      console.log('[incipit dump] walked up', upDepth, 'fibers to root');
+
+      const KNOWN_BLOCK_TYPES = new Set([
+        'tool_use', 'tool_result', 'text', 'image',
+        'thinking', 'redacted_thinking', 'document', 'server_tool_use', 'web_search_tool_result'
+      ]);
+      function fiberName(fb) {
+        if (!fb) return '?';
+        const t = fb.type;
+        if (t == null) return 'null';
+        if (typeof t === 'string') return t;
+        if (typeof t === 'function') return t.displayName || t.name || 'Fn';
+        if (typeof t === 'object') {
+          return t.displayName ||
+                 (t.render && (t.render.displayName || t.render.name)) ||
+                 (t.type && (t.type.displayName || t.type.name)) ||
+                 'Obj';
+        }
+        return String(t);
+      }
+      function looksLikeBlock(v) {
+        return v && typeof v === 'object' &&
+               typeof v.type === 'string' &&
+               KNOWN_BLOCK_TYPES.has(v.type);
+      }
+      function describeBlock(b) {
+        const id = b.id || b.tool_use_id || '';
+        let contentKind = null;
+        if (Array.isArray(b.content)) contentKind = 'arr[' + b.content.length + ']';
+        else if (typeof b.content === 'string') contentKind = 'str[' + b.content.length + ']';
+        else if (b.content != null) contentKind = typeof b.content;
+        return {
+          type: b.type,
+          id: id ? id.slice(-8) : undefined,
+          name: b.name,
+          contentKind,
+        };
+      }
+
+      const findings = [];
+      const visited = new WeakSet();
+      function scan(fb, depth) {
+        if (!fb || visited.has(fb)) return;
+        visited.add(fb);
+        const p = fb.memoizedProps;
+        if (p && typeof p === 'object' && !Array.isArray(p)) {
+          for (const k of Object.keys(p)) {
+            const v = p[k];
+            if (Array.isArray(v) && v.length && v.some(looksLikeBlock)) {
+              findings.push({
+                depth,
+                fiber: fiberName(fb),
+                propKey: k,
+                arrLen: v.length,
+                blocks: v.filter(looksLikeBlock).map(describeBlock),
+              });
+            } else if (looksLikeBlock(v)) {
+              findings.push({
+                depth,
+                fiber: fiberName(fb),
+                propKey: k,
+                block: describeBlock(v),
+              });
+            }
+          }
+        }
+        scan(fb.child, depth + 1);
+        scan(fb.sibling, depth);
+      }
+      scan(f, 0);
+
+      const toolResultHits = findings.filter(x =>
+        (x.blocks && x.blocks.some(b => b.type === 'tool_result')) ||
+        (x.block && x.block.type === 'tool_result')
+      );
+      const toolUseHits = findings.filter(x =>
+        (x.blocks && x.blocks.some(b => b.type === 'tool_use')) ||
+        (x.block && x.block.type === 'tool_use')
+      );
+
+      console.log('[incipit dump] total findings:', findings.length);
+      console.log('[incipit dump] tool_result hits:', toolResultHits);
+      console.log('[incipit dump] tool_use hits:', toolUseHits);
+      console.log('[incipit dump] all findings:', findings);
+      window.__incipitFiberRoot = f;
+      window.__incipitFiberFindings = findings;
+      console.log('[incipit dump] stashed: window.__incipitFiberRoot, window.__incipitFiberFindings');
+      return { root: f, findings, toolResultHits, toolUseHits };
+    };
+
+    function readToolResult(useBlock, el) {
+      if (!useBlock || !useBlock.id) return null;
+      const targetId = useBlock.id;
+
+      const fk = Object.keys(el).find(k => k.startsWith('__reactFiber'));
+      if (!fk) return null;
+
+      let f = el[fk];
+      for (let i = 0; i < 30 && f; i++) {
+        const c = f.memoizedProps && f.memoizedProps.content;
+        if (c && typeof c === 'object' && c.toolResultSignal) {
+          try {
+            const sig = c.toolResultSignal;
+            const tr = typeof sig.peek === 'function' ? sig.peek() : sig.value;
+            if (tr && tr.type === 'tool_result' && tr.tool_use_id === targetId) {
+              return tr;
+            }
+          } catch (_) { /* signal read failed; fall through */ }
+          break; // found the wrapper but couldn't read — don't keep walking
+        }
+        f = f.return;
+      }
+
+      // Diagnostic: signal not found on any ancestor. Fires once per
+      // tool_use_id; if this prints in production, host changed the
+      // wrapping prop shape and we should re-run __incipitDumpFiber.
+      if (!_toolResultDiagSeen.has(targetId)) {
+        _toolResultDiagSeen.add(targetId);
+        console.warn('[incipit] toolResultSignal not found for', targetId.slice(-8),
+                     '— host fiber prop shape may have changed; run __incipitDumpFiber()');
+      }
+      return null;
+    }
+
+    function extractResultText(result) {
+      if (!result || !result.content) return '';
+      if (typeof result.content === 'string') return result.content;
+      if (Array.isArray(result.content)) {
+        return result.content
+          .filter(c => c && c.type === 'text' && typeof c.text === 'string')
+          .map(c => c.text)
+          .join('\n');
+      }
+      return '';
+    }
+
+    function readToolUseBlock(el) {
+      const fk = Object.keys(el).find(k => k.startsWith('__reactFiber'));
+      if (!fk) return null;
+      let f = el[fk];
+      for (let i = 0; i < 10 && f; i++) {
+        const p = f.memoizedProps;
+        if (p && p.content) {
+          const outer = p.content;
+          if (outer.type === 'tool_use') {
+            return { block: outer, status: p.status };
+          }
+          if (outer.content && outer.content.type === 'tool_use') {
+            return { block: outer.content, status: p.status };
+          }
+        }
+        f = f.return;
+      }
+      return null;
+    }
+
+    function lineDiffStats(oldText, newText) {
+      const a = String(oldText == null ? '' : oldText).split('\n');
+      const b = String(newText == null ? '' : newText).split('\n');
+      const m = a.length, n = b.length;
+      if (m === 0 && n === 0) return { added: 0, removed: 0 };
+      if (m * n > 500000) {
+        return {
+          added: Math.max(0, n - m),
+          removed: Math.max(0, m - n),
+        };
+      }
+      const prev = new Array(n + 1).fill(0);
+      const curr = new Array(n + 1).fill(0);
+      for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+          if (a[i - 1] === b[j - 1]) curr[j] = prev[j - 1] + 1;
+          else curr[j] = curr[j - 1] > prev[j] ? curr[j - 1] : prev[j];
+        }
+        for (let j = 0; j <= n; j++) prev[j] = curr[j];
+      }
+      const lcs = prev[n];
+      return { added: n - lcs, removed: m - lcs };
+    }
+
+    function computeStats(block) {
+      if (!block || !block.input) return null;
+      const name = block.name;
+      const input = block.input;
+      if (name === 'Edit' || name === 'MultiEdit') {
+        if (typeof input.old_string === 'string' && typeof input.new_string === 'string') {
+          return lineDiffStats(input.old_string, input.new_string);
+        }
+      } else if (name === 'Write') {
+        if (typeof input.content === 'string') {
+          const lines = input.content === '' ? 0 : input.content.split('\n').length;
+          return { added: lines, removed: 0 };
+        }
+      }
+      return null;
+    }
+
+    // Per-tool label shown in expanded state in place of the host
+    // secondaryLine / our fallback fingerprint. Edit / MultiEdit / Write
+    // own the row with `+N -M`, so they never get a label.
+    function pickLabelFor(name) {
+      switch (name) {
+        case 'Edit': case 'MultiEdit': case 'Write': return null;
+        case 'Bash': case 'PowerShell':              return 'command';
+        case 'Grep': case 'Glob':                    return 'pattern';
+        case 'WebSearch': case 'ToolSearch':         return 'query';
+        case 'WebFetch':                             return 'url';
+        case 'Task': case 'Agent':                   return 'description';
+        case 'TodoWrite':                            return 'todos';
+        case 'LSP':                                  return 'operation';
+        default:
+          return (typeof name === 'string' && name.startsWith('mcp__')) ? 'args' : null;
+      }
+    }
+
+    // Fallback fingerprint for tools whose host secondaryLine is empty
+    // (PowerShell / LSP / many MCP tools). Only consulted when host
+    // secondaryLine has no text — never overwrites the host's own.
+    function pickFallbackFingerprint(name, input) {
+      if (!input || typeof input !== 'object') return null;
+      const s = (k) => typeof input[k] === 'string' && input[k] ? input[k] : null;
+      switch (name) {
+        case 'Bash': case 'PowerShell':      return s('command');
+        case 'Grep': case 'Glob':            return s('pattern');
+        case 'WebSearch': case 'ToolSearch': return s('query');
+        case 'WebFetch':                     return s('url');
+        case 'Task': case 'Agent':           return s('description');
+        case 'TodoWrite': {
+          const todos = input.todos;
+          if (Array.isArray(todos) && todos.length) {
+            const first = todos[0];
+            const head = first && typeof first.content === 'string' ? first.content : (todos.length + ' items');
+            return todos.length > 1 ? head + ' (+' + (todos.length - 1) + ' more)' : head;
+          }
+          return null;
+        }
+        case 'LSP': {
+          const op = s('operation') || '';
+          const fp = s('filePath') || '';
+          const ln = typeof input.line === 'number' ? input.line : null;
+          const base = fp ? fp.split(/[\\/]/).pop() : '';
+          let out = op;
+          if (base) out += (out ? ' ' : '') + base;
+          if (ln != null) out += ':' + ln;
+          return out || null;
+        }
+        default: {
+          for (const k of Object.keys(input)) {
+            const v = input[k];
+            if (typeof v === 'string' && v) return v;
+          }
+          return null;
+        }
+      }
+    }
+
+    // Grep-only single-line layout helper. Mirrors the host's standalone
+    // `secondaryLine_*` row ("N lines of output") into a span injected at
+    // the end of titleWrap, so the collapsed Grep summary reads as one
+    // line instead of two. The CSS rules behind `data-incipit-tool-grep`
+    // hide the host secondaryLine while collapsed and reveal it again
+    // when expanded — host gets its native two-row layout back at that
+    // point. Decoupling: every selector keys off our own data-attrs, no
+    // host class enters the cascade.
+    // OUT-row truncation thresholds. Grep can return hundreds of matched
+    // lines — letting them all flow into a single tool entry hijacks the
+    // viewport (violates "reading first, tool second"). Grep results are
+    // especially scannable and repetitive, so keep the inline allowance
+    // tighter than generic tool output: first 7 lines (or up to 1800 chars
+    // at last full-line boundary), with full output only at ≤ 9 lines and
+    // ≤ 1800 chars.
+    const GREP_OUT_KEEP_LINES = 7;
+    const GREP_OUT_FULL_BELOW_LINES = 9;
+    const GREP_OUT_KEEP_CHARS = 1800;
+
+    function applyGrepOutTruncation(outContent, fullText) {
+      const lines = fullText.split('\n');
+      const tooManyLines = lines.length > GREP_OUT_FULL_BELOW_LINES;
+      const tooManyChars = fullText.length > GREP_OUT_KEEP_CHARS;
+      const needsTruncation = tooManyLines || tooManyChars;
+
+      if (!needsTruncation) {
+        // Short content — display full, no toggle.
+        if (outContent.firstChild?.nodeType !== 3 ||
+            outContent.firstChild.nodeValue !== fullText ||
+            outContent.childNodes.length !== 1) {
+          while (outContent.firstChild) outContent.removeChild(outContent.firstChild);
+          outContent.appendChild(document.createTextNode(fullText));
+        }
+        return;
+      }
+
+      // Trim by line count first, then clip to char budget at the last
+      // full-line boundary so we never cut mid-line (would mislead).
+      let kept = lines.slice(0, GREP_OUT_KEEP_LINES).join('\n');
+      if (kept.length > GREP_OUT_KEEP_CHARS) {
+        const clipped = kept.slice(0, GREP_OUT_KEEP_CHARS);
+        const lastNL = clipped.lastIndexOf('\n');
+        kept = lastNL > 0 ? clipped.slice(0, lastNL) : clipped;
+      }
+      const keptLineCount = kept.split('\n').length;
+      const hidden = lines.length - keptLineCount;
+      const moreText = '+ ' + hidden + ' more line' + (hidden === 1 ? '' : 's');
+      const lessText = '− show less';
+
+      // Toggle state: button sits at the visual tail of the OUT content
+      // (after `kept` when collapsed, after `fullText` when expanded), so
+      // a user reading to the bottom of the long output finds the
+      // collapse affordance at the natural end-of-read point.
+      const expanded = outContent.dataset.userExpanded === '1';
+      const visibleText = expanded ? fullText : kept;
+      const btnText = expanded ? lessText : moreText;
+
+      // Idempotent: skip rebuild if structure already matches.
+      const first = outContent.firstChild;
+      const last = outContent.lastChild;
+      if (first && first.nodeType === 3 && first.nodeValue === visibleText &&
+          last && last.nodeType === 1 &&
+          last.getAttribute && last.getAttribute('data-incipit-tool-grep-more') !== null &&
+          last.textContent === btnText) {
+        return;
+      }
+
+      while (outContent.firstChild) outContent.removeChild(outContent.firstChild);
+      outContent.appendChild(document.createTextNode(visibleText));
+      const btn = document.createElement('span');
+      btn.setAttribute('data-incipit-tool-grep-more', '');
+      btn.textContent = btnText;
+      btn.addEventListener('click', evt => {
+        // Don't fold the parent grep entry on click of this toggle.
+        evt.stopPropagation();
+        const wasExpanded = outContent.dataset.userExpanded === '1';
+        if (wasExpanded) {
+          // Collapsing — preserve the button's viewport anchor. After
+          // collapse the OUT body shrinks by hundreds of pixels; if we
+          // do nothing, the user's focus point falls into whatever
+          // content happens to be sitting at that absolute Y now (next
+          // tool call, next message), which is disorienting. Capture
+          // the button's clientRect before mutation, run the rebuild,
+          // then scroll the nearest overflow ancestor by the delta so
+          // the rebuilt button lands at the same viewport Y.
+          const beforeTop = btn.getBoundingClientRect().top;
+          outContent.dataset.userExpanded = '0';
+          applyGrepOutTruncation(outContent, fullText);
+          const newBtn = outContent.querySelector('[data-incipit-tool-grep-more]');
+          if (newBtn) {
+            const afterTop = newBtn.getBoundingClientRect().top;
+            const delta = afterTop - beforeTop;
+            if (delta !== 0) {
+              const scroller = findScrollAncestor(outContent);
+              if (scroller === window) window.scrollBy(0, delta);
+              else scroller.scrollTop += delta;
+            }
+          }
+        } else {
+          // Expanding — leave viewport alone. The button is already in
+          // view (user just clicked it); content grows downward from a
+          // stable origin, which matches the user's mental model.
+          outContent.dataset.userExpanded = '1';
+          applyGrepOutTruncation(outContent, fullText);
+        }
+      });
+      outContent.appendChild(btn);
+    }
+
+    // ----------------------------------------------------------------
+    // Generic IN/OUT row truncation for the host's `toolBodyGrid`
+    // template (Bash, PowerShell, LSP, MCP, Read, TodoWrite, Write,
+    // NotebookEdit, WebSearch, etc. — every tool whose body is rendered
+    // through the shared grid). Edit/MultiEdit diff blocks use
+    // diffEditorWrapper, not toolBodyGrid, so they bypass this code
+    // path. Grep takes its own route through `applyGrepOutTruncation`
+    // because it pierces the Preact result signal and replaces text
+    // wholesale; here we cooperate with React-owned <pre> nodes by
+    // CSS-clipping them in place and parking a sibling toggle button
+    // outside the clip box.
+    //
+    // Generic tool output keeps a slightly looser allowance than Grep:
+    // grep results are repetitive scan lists and use their own tighter
+    // `applyGrepOutTruncation` path above.
+    //   - ≤ 15 logical lines or ≤ 3000 chars: full body, no toggle
+    //   - otherwise: clip to ~12 lines worth of vertical space
+    //     (CSS `max-height: 18em`, since cells render at 11px / 1.5
+    //     line-height = 16.5px per line, 12 × 16.5 ≈ 198px = 18em)
+    //     and append "+ N more lines" toggle
+    //
+    // CSS clip vs text-replace: text-replace would lose syntax
+    // highlighting that hljs may apply on the host <pre>, and would
+    // race React's reconcile (host owns this DOM, we don't). CSS clip
+    // leaves DOM untouched; we only set/clear our own data-attr and
+    // add a sibling button. Idempotent across re-decorates.
+    // ----------------------------------------------------------------
+    const TOOL_OUT_KEEP_LINES = 12;
+    const TOOL_OUT_FULL_BELOW_LINES = 15;
+    const TOOL_OUT_KEEP_CHARS = 3000;
+
+    function applyToolBodyTruncation(grid) {
+      const rows = grid.querySelectorAll('[class*="toolBodyRow"]');
+      for (const row of rows) {
+        const content = row.querySelector('[class*="toolBodyRowContent"]');
+        if (!content) continue;
+        applyToolRowTruncation(content);
+      }
+    }
+
+    function applyToolRowTruncation(content) {
+      // Pick the inner element to clip. OUT cells wrap their pre in a
+      // `toolResult_*` div; IN cells expose <pre> directly.
+      const clipTarget = content.querySelector('[class*="toolResult_"]') ||
+                         content.querySelector('pre');
+      if (!clipTarget) return;
+
+      const fullText = clipTarget.textContent || '';
+      const lines = fullText.split('\n');
+      const tooLong = lines.length > TOOL_OUT_FULL_BELOW_LINES ||
+                      fullText.length > TOOL_OUT_KEEP_CHARS;
+
+      // Short content — clear any prior truncation state, drop button.
+      if (!tooLong) {
+        if (clipTarget.getAttribute('data-incipit-tool-out-clipped') !== null) {
+          clipTarget.removeAttribute('data-incipit-tool-out-clipped');
+        }
+        const oldBtn = content.querySelector(':scope > [data-incipit-tool-out-more]');
+        if (oldBtn) oldBtn.remove();
+        if (content.dataset.userExpanded) delete content.dataset.userExpanded;
+        return;
+      }
+
+      // Long content — apply / lift clip based on user-expanded state.
+      const expanded = content.dataset.userExpanded === '1';
+      if (expanded) {
+        if (clipTarget.getAttribute('data-incipit-tool-out-clipped') !== null) {
+          clipTarget.removeAttribute('data-incipit-tool-out-clipped');
+        }
+      } else {
+        if (clipTarget.getAttribute('data-incipit-tool-out-clipped') !== '1') {
+          clipTarget.setAttribute('data-incipit-tool-out-clipped', '1');
+        }
+      }
+
+      // Toggle button. Lives as the LAST child of the content cell so
+      // overflow:hidden on clipTarget never swallows it.
+      const hidden = Math.max(lines.length - TOOL_OUT_KEEP_LINES, 0);
+      const moreText = '+ ' + hidden + ' more line' + (hidden === 1 ? '' : 's');
+      const lessText = '− show less'; // U+2212 minus, visually paired with '+'
+      const btnText = expanded ? lessText : moreText;
+
+      let btn = content.querySelector(':scope > [data-incipit-tool-out-more]');
+      if (!btn) {
+        btn = document.createElement('span');
+        btn.setAttribute('data-incipit-tool-out-more', '');
+        btn.addEventListener('click', evt => {
+          // Don't fold the parent tool entry on click of this toggle.
+          evt.stopPropagation();
+          const wasExpanded = content.dataset.userExpanded === '1';
+          if (wasExpanded) {
+            // Collapsing — preserve viewport anchor like the Grep path.
+            // Without this, the user's focus point falls into whatever
+            // tool/message happens to be at that absolute Y after the
+            // OUT body shrinks by hundreds of pixels.
+            const beforeTop = btn.getBoundingClientRect().top;
+            content.dataset.userExpanded = '0';
+            applyToolRowTruncation(content);
+            const newBtn = content.querySelector(':scope > [data-incipit-tool-out-more]');
+            if (newBtn) {
+              const afterTop = newBtn.getBoundingClientRect().top;
+              const delta = afterTop - beforeTop;
+              if (delta !== 0) {
+                const scroller = findScrollAncestor(content);
+                if (scroller === window) window.scrollBy(0, delta);
+                else scroller.scrollTop += delta;
+              }
+            }
+          } else {
+            content.dataset.userExpanded = '1';
+            applyToolRowTruncation(content);
+          }
+        });
+        content.appendChild(btn);
+      }
+      if (btn.textContent !== btnText) btn.textContent = btnText;
+      // React may append elements after our button across reconciles —
+      // keep button at the tail so it sits below the clip box visually.
+      if (content.lastChild !== btn) content.appendChild(btn);
+    }
+
+    // Grep filename click-to-open.
+    //
+    // Host already wires Read/Edit filenames to `context.fileOpener.open`,
+    // which sends the normal `open_file` request through Claude Code's
+    // existing webview -> extension channel. Reuse that exact opener instead
+    // of adding an incipit message channel or calling `acquireVsCodeApi()`.
+    //
+    // Fragility: this reads the React function-component props above the
+    // tool-use DOM node and expects a `context.fileOpener.open` shape. If
+    // Claude Code refactors that prop, return null and leave the Grep filename
+    // as tooltip-only text.
+    function readHostFileOpener(el) {
+      const fk = Object.keys(el).find(k => k.startsWith('__reactFiber'));
+      if (!fk) return null;
+      let f = el[fk];
+      for (let i = 0; i < 30 && f; i++) {
+        const ctx = f.memoizedProps && f.memoizedProps.context;
+        const opener = ctx && ctx.fileOpener;
+        if (opener && typeof opener.open === 'function') return opener;
+        f = f.return;
+      }
+      return null;
+    }
+
+    function validLineNumber(value) {
+      const n = Number(value);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+    }
+
+    function firstGrepLineNumber(resultText, filePath) {
+      if (!resultText) return null;
+      const rawPath = typeof filePath === 'string' ? filePath.trim() : '';
+      const normPath = rawPath.replace(/\\/g, '/');
+      const parts = normPath.split('/').filter(Boolean);
+      const basename = parts.length ? parts[parts.length - 1] : '';
+      const candidates = [];
+      if (normPath) candidates.push(normPath);
+      if (basename && basename !== normPath) candidates.push(basename);
+
+      const lines = String(resultText).split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        // File-scoped grep output often begins with `123:matched text`.
+        let m = line.match(/^(\d+)(?=[:\-\s]|$)/);
+        let n = m && validLineNumber(m[1]);
+        if (n) return n;
+
+        // Path-scoped output is usually `path:123:matched text`. Windows
+        // drive letters are safe here because we match only after the known
+        // full path or basename, not after every colon in the string.
+        const normLine = line.replace(/\\/g, '/');
+        for (let j = 0; j < candidates.length; j++) {
+          const c = candidates[j];
+          const idx = normLine.lastIndexOf(c);
+          if (idx === -1) continue;
+          if (c === basename && idx > 0 && normLine.charAt(idx - 1) !== '/') continue;
+          const rest = normLine.slice(idx + c.length);
+          m = rest.match(/^\s*[:\-\s]\s*(\d+)(?=[:\-\s]|$)/);
+          n = m && validLineNumber(m[1]);
+          if (n) return n;
+        }
+      }
+      return null;
+    }
+
+    function bindGrepFilenameOpen(fnSpan, toolEl) {
+      if (fnSpan.dataset.incipitToolGrepClickBound === '1') return;
+
+      const open = (evt) => {
+        const opener = readHostFileOpener(toolEl);
+        const filePath = fnSpan.dataset.incipitToolGrepPath ||
+                         fnSpan.dataset.incipitToolFullpath;
+        if (!opener || !filePath) return;
+
+        evt.preventDefault();
+        evt.stopPropagation();
+
+        const line = validLineNumber(fnSpan.dataset.incipitToolGrepLine);
+        const location = line ? { startLine: line, endLine: line } : undefined;
+        try {
+          opener.open(filePath, location);
+        } catch (e) {
+          console.warn('[incipit] failed to open grep filename', e);
+        }
+      };
+
+      fnSpan.addEventListener('click', open);
+      fnSpan.addEventListener('keydown', evt => {
+        if (evt.key !== 'Enter' && evt.key !== ' ') return;
+        open(evt);
+      });
+      fnSpan.dataset.incipitToolGrepClickBound = '1';
+    }
+
+    // Generic tool header path support.
+    //
+    // Host-native Read/Edit/Write/NotebookEdit/ExitPlanMode already render
+    // clickable anchors, but their visible text is often only a basename, so
+    // `truncatePathSpan` cannot infer the full path for our tooltip. Other
+    // file-ish tools (notably fallback-rendered MultiEdit / LSP-style tools)
+    // may expose the file path only through the fiber `tool_use.input` object.
+    //
+    // Reuse the same host `context.fileOpener.open` object that Grep uses.
+    // No new webview -> extension message channel, no acquireVsCodeApi patch.
+    //
+    // Fragility: this composes two existing pierces:
+    //   1. `readToolUseBlock` for the tool input shape.
+    //   2. `readHostFileOpener` for `context.fileOpener`.
+    // If either host shape drifts, decoration falls back to tooltip-only
+    // (or host-native anchors keep working by themselves).
+    const toolPathOpenSpecs = new WeakMap();
+
+    function basenameOfPath(filePath) {
+      const s = typeof filePath === 'string' ? filePath.trim() : '';
+      if (!s) return '';
+      const parts = s.split(/[\\/]+/).filter(Boolean);
+      return parts.length ? parts[parts.length - 1] : s;
+    }
+
+    function isUrlLike(value) {
+      return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(String(value || ''));
+    }
+
+    function looksLikeLocalPath(value, allowWhitespace) {
+      const s = typeof value === 'string' ? value.trim() : '';
+      if (!s || s.includes('\n') || isUrlLike(s)) return false;
+      if (!allowWhitespace && /\s/.test(s)) return false;
+      if (/^[a-zA-Z]:[\\/]/.test(s)) return true;
+      if (s.startsWith('/') || s.startsWith('./') || s.startsWith('../') ||
+          s.startsWith('.\\') || s.startsWith('..\\') || s.startsWith('~')) {
+        return true;
+      }
+      if (s.includes('/') || s.includes('\\')) return true;
+      return /\.[a-zA-Z0-9]{1,10}$/.test(s);
+    }
+
+    function looksLikeFilename(value) {
+      const base = basenameOfPath(value);
+      if (!base) return false;
+      if (/\.[a-zA-Z0-9]{1,10}$/.test(base)) return true;
+      return /^(Makefile|Dockerfile|Containerfile|Rakefile|Gemfile|Procfile|Brewfile)$/i.test(base);
+    }
+
+    function offsetLimitLocation(input) {
+      const offset = input && input.offset !== void 0 ? Number(input.offset) : NaN;
+      const start = Number.isFinite(offset) ? validLineNumber(offset + 1) : null;
+      if (!start) return null;
+      const limit = input.limit !== void 0 ? Number(input.limit) : NaN;
+      const end = Number.isFinite(limit) ? validLineNumber(offset + limit) : null;
+      return end ? { startLine: start, endLine: end } : { startLine: start };
+    }
+
+    function lineFieldLocation(input) {
+      if (!input || typeof input !== 'object') return null;
+      const start =
+        validLineNumber(input.startLine) ||
+        validLineNumber(input.lineNumber) ||
+        validLineNumber(input.line);
+      if (!start) return null;
+      const end = validLineNumber(input.endLine) || start;
+      return { startLine: start, endLine: end };
+    }
+
+    function firstMultiEditSearchText(input) {
+      const edits = input && Array.isArray(input.edits) ? input.edits : [];
+      for (const edit of edits) {
+        if (edit && typeof edit.new_string === 'string' && edit.new_string) return edit.new_string;
+      }
+      return null;
+    }
+
+    function makePathSpec(path, source, location, preferInject) {
+      const allowWhitespace = source !== 'path';
+      if (!looksLikeLocalPath(path, allowWhitespace)) return null;
+      // Bare `path` is ambiguous in MCP / search-like tools: it may be a
+      // server route or a directory root. Treat it as a file only when the
+      // basename looks file-like or line metadata makes the file intent clear.
+      if (source === 'path' && !location && !looksLikeFilename(path)) return null;
+      return {
+        path: path.trim(),
+        source,
+        location: location || null,
+        preferInject: !!preferInject,
+      };
+    }
+
+    function toolFilePathSpecs(block) {
+      if (!block || !block.input || typeof block.input !== 'object') return [];
+      const input = block.input;
+      const name = block.name;
+      const specs = [];
+      const push = (path, source, location, preferInject) => {
+        const spec = makePathSpec(path, source, location, preferInject);
+        if (spec) specs.push(spec);
+      };
+
+      if (name === 'Grep') return specs; // Grep owns its custom filename UI.
+
+      if (name === 'ReadCoalesced' && Array.isArray(input.fileReads)) {
+        for (const fileRead of input.fileReads) {
+          if (!fileRead || typeof fileRead !== 'object') continue;
+          push(fileRead.file_path, 'fileReads.file_path', offsetLimitLocation(fileRead), false);
+        }
+        return specs;
+      }
+
+      if (typeof input.file_path === 'string') {
+        let location = offsetLimitLocation(input) || lineFieldLocation(input);
+        if (!location && name === 'Edit' && typeof input.new_string === 'string' && input.new_string) {
+          location = { searchText: input.new_string };
+        } else if (!location && name === 'MultiEdit') {
+          const searchText = firstMultiEditSearchText(input);
+          if (searchText) location = { searchText };
+        }
+        push(input.file_path, 'file_path', location, name === 'MultiEdit');
+      }
+
+      if (typeof input.notebook_path === 'string') {
+        push(input.notebook_path, 'notebook_path', null, false);
+      }
+
+      if (typeof input.planFilePath === 'string') {
+        push(input.planFilePath, 'planFilePath', null, false);
+      }
+
+      if (typeof input.filePath === 'string') {
+        push(input.filePath, 'filePath', lineFieldLocation(input), false);
+      }
+
+      // Generic `path` is often a search directory for Grep/Glob/Search.
+      // Only treat it as file-ish for other tools and only when it passes
+      // the local-path probe above.
+      if (!specs.length &&
+          name !== 'Glob' &&
+          name !== 'Search' &&
+          typeof input.path === 'string') {
+        push(input.path, 'path', lineFieldLocation(input), false);
+      }
+
+      return specs;
+    }
+
+    function firstToolPathForDisplay(block) {
+      if (!block || !block.input || typeof block.input !== 'object') return '';
+      const specs = toolFilePathSpecs(block);
+      if (specs.length && specs[0].path) return specs[0].path;
+
+      const input = block.input;
+      const fields = ['file_path', 'filePath', 'path', 'notebook_path', 'planFilePath'];
+      for (const field of fields) {
+        if (typeof input[field] === 'string' && input[field].trim()) {
+          return input[field].trim();
+        }
+      }
+      return '';
+    }
+
+    function languageClassForFilePath(filePath) {
+      const base = basenameOfPath(filePath).toLowerCase();
+      const m = base.match(/\.([a-z0-9]+)$/);
+      const ext = m ? m[1] : base;
+      const langByExt = {
+        bash: 'bash',
+        bat: 'dos',
+        c: 'c',
+        cc: 'cpp',
+        cls: 'apex',
+        cmd: 'dos',
+        cpp: 'cpp',
+        cs: 'csharp',
+        css: 'css',
+        csv: 'csv',
+        cxx: 'cpp',
+        diff: 'diff',
+        dockerfile: 'dockerfile',
+        go: 'go',
+        h: 'cpp',
+        hpp: 'cpp',
+        html: 'xml',
+        ini: 'ini',
+        java: 'java',
+        js: 'javascript',
+        json: 'json',
+        jsonl: 'json',
+        jsx: 'javascript',
+        kt: 'kotlin',
+        less: 'less',
+        lua: 'lua',
+        m: 'objectivec',
+        // Diff previews must display markdown-family files as literal source.
+        // highlight.js' markdown lexer injects semantic spans such as
+        // `.hljs-strong` / `.hljs-bullet`, which visually reads as markdown
+        // rendering inside the diff. Force these files through plaintext.
+        markdown: 'plaintext',
+        md: 'plaintext',
+        mdx: 'plaintext',
+        mdown: 'plaintext',
+        mkd: 'plaintext',
+        mjs: 'javascript',
+        mm: 'objectivec',
+        patch: 'diff',
+        php: 'php',
+        ps1: 'powershell',
+        py: 'python',
+        rb: 'ruby',
+        rs: 'rust',
+        scss: 'scss',
+        sh: 'bash',
+        sql: 'sql',
+        swift: 'swift',
+        toml: 'toml',
+        ts: 'typescript',
+        tsx: 'typescript',
+        txt: 'plaintext',
+        xml: 'xml',
+        yaml: 'yaml',
+        yml: 'yaml',
+      };
+      const lang = langByExt[ext] || 'plaintext';
+      return 'language-' + lang;
+    }
+
+    function findDirectChildByAttr(parent, attrName) {
+      if (!parent || !parent.children) return null;
+      for (const child of parent.children) {
+        if (child && child.hasAttribute && child.hasAttribute(attrName)) return child;
+      }
+      return null;
+    }
+
+    function ensureDiffHeader(container) {
+      if (!container) return null;
+      let header = findDirectChildByAttr(container, 'data-incipit-diff-header');
+      let titleSpan, countsSpan, addedSpan, removedSpan;
+      if (!header) {
+        header = document.createElement('div');
+        header.setAttribute('data-incipit-diff-header', '');
+
+        titleSpan = document.createElement('span');
+        titleSpan.setAttribute('data-incipit-diff-title', '');
+        countsSpan = document.createElement('span');
+        countsSpan.setAttribute('data-incipit-diff-counts', '');
+        addedSpan = document.createElement('span');
+        addedSpan.setAttribute('data-incipit-tool-added', '');
+        removedSpan = document.createElement('span');
+        removedSpan.setAttribute('data-incipit-tool-removed', '');
+
+        countsSpan.appendChild(addedSpan);
+        countsSpan.appendChild(removedSpan);
+        header.appendChild(titleSpan);
+        header.appendChild(countsSpan);
+        container.insertBefore(header, container.firstChild);
+      } else {
+        titleSpan = header.querySelector('[data-incipit-diff-title]');
+        countsSpan = header.querySelector('[data-incipit-diff-counts]');
+        addedSpan = header.querySelector('[data-incipit-tool-added]');
+        removedSpan = header.querySelector('[data-incipit-tool-removed]');
+      }
+
+      if (!titleSpan || !countsSpan || !addedSpan || !removedSpan) return null;
+      return { header, titleSpan, countsSpan, addedSpan, removedSpan };
+    }
+
+    function updateDiffHeader(container, block, stats) {
+      const parts = ensureDiffHeader(container);
+      if (!parts) return null;
+      const { titleSpan, addedSpan, removedSpan } = parts;
+
+      const filePath = firstToolPathForDisplay(block);
+      const title = basenameOfPath(filePath) || filePath || 'diff';
+      if (titleSpan.textContent !== title) titleSpan.textContent = title;
+      if (filePath) {
+        if (titleSpan.dataset.incipitToolFullpath !== filePath) {
+          titleSpan.dataset.incipitToolFullpath = filePath;
+        }
+      } else if (titleSpan.dataset.incipitToolFullpath) {
+        delete titleSpan.dataset.incipitToolFullpath;
+      }
+
+      const wantAdded = '+' + stats.added;
+      const wantRemoved = '\u2212' + stats.removed;
+      if (addedSpan.textContent !== wantAdded) addedSpan.textContent = wantAdded;
+      if (removedSpan.textContent !== wantRemoved) removedSpan.textContent = wantRemoved;
+      return parts.header;
+    }
+
+    function decorateInlineDiffHeader(body, block, stats) {
+      const wrapper = body && body.querySelector && body.querySelector('[class*="diffEditorWrapper"]');
+      if (!wrapper) return;
+
+      const header = findDirectChildByAttr(wrapper, 'data-incipit-diff-header');
+      if (!stats) {
+        if (header) header.remove();
+        return;
+      }
+
+      updateDiffHeader(wrapper, block, stats);
+      const lineInfoKey = ensureDiffLineInfo(wrapper, block);
+      bindDiffModalKeyCapture(wrapper, lineInfoKey);
+      scheduleDiffSideBars();
+    }
+
+    function cleanupWriteDiffBody(el, body) {
+      if (el && el.dataset.incipitToolWriteDiff) delete el.dataset.incipitToolWriteDiff;
+      if (el && el.dataset.incipitToolDiffIsland) delete el.dataset.incipitToolDiffIsland;
+      const diff = body && body.querySelector && body.querySelector(':scope > [data-incipit-write-diff]');
+      if (diff) diff.remove();
+    }
+
+    const WRITE_DIFF_PREVIEW_LINES = 16;
+    const WRITE_DIFF_FULL_BELOW_LINES = 18;
+    let writeDiffModal = null;
+
+    function writeDiffLines(text) {
+      return text === '' ? [] : String(text).split('\n');
+    }
+
+    function rangesFromChangedIndexes(indexes) {
+      if (!indexes.length) return [];
+      const ranges = [];
+      let start = indexes[0];
+      let prev = indexes[0];
+      for (let i = 1; i < indexes.length; i++) {
+        const cur = indexes[i];
+        if (cur === prev + 1) {
+          prev = cur;
+          continue;
+        }
+        ranges.push([start, prev + 1]);
+        start = prev = cur;
+      }
+      ranges.push([start, prev + 1]);
+      return ranges;
+    }
+
+    function lcsLength(a, b, maxCells) {
+      const m = a.length;
+      const n = b.length;
+      if (!m || !n) return 0;
+      if (maxCells && m * n > maxCells) return null;
+      const prev = new Uint32Array(n + 1);
+      const curr = new Uint32Array(n + 1);
+      for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+          curr[j] = a[i - 1] === b[j - 1]
+            ? prev[j - 1] + 1
+            : Math.max(prev[j], curr[j - 1]);
+        }
+        prev.set(curr);
+      }
+      return prev[n];
+    }
+
+    function diffLineTokens(text) {
+      return String(text || '').match(/[A-Za-z_$][A-Za-z0-9_$]*|\d+(?:\.\d+)?|[^\sA-Za-z0-9_$]/g) || [];
+    }
+
+    function prefixSuffixSimilarity(a, b) {
+      let prefix = 0;
+      while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix++;
+      let aEnd = a.length;
+      let bEnd = b.length;
+      while (aEnd > prefix && bEnd > prefix && a[aEnd - 1] === b[bEnd - 1]) {
+        aEnd--;
+        bEnd--;
+      }
+      return (2 * (prefix + (a.length - aEnd))) / (a.length + b.length);
+    }
+
+    function intralinePairScore(oldText, newText) {
+      const oldTrimmed = String(oldText || '').trim();
+      const newTrimmed = String(newText || '').trim();
+      if (!oldTrimmed || !newTrimmed || oldTrimmed === newTrimmed) return 0;
+
+      const oldChars = Array.from(oldTrimmed);
+      const newChars = Array.from(newTrimmed);
+      const lengthRatio = Math.min(oldChars.length, newChars.length) /
+        Math.max(oldChars.length, newChars.length);
+      if (lengthRatio < 0.35) return 0;
+
+      const charLcs = lcsLength(oldChars, newChars, 40000);
+      const charSimilarity = charLcs == null
+        ? prefixSuffixSimilarity(oldChars, newChars)
+        : (2 * charLcs) / (oldChars.length + newChars.length);
+
+      const oldTokens = diffLineTokens(oldTrimmed);
+      const newTokens = diffLineTokens(newTrimmed);
+      const tokenLcs = lcsLength(oldTokens, newTokens, 40000);
+      const tokenSimilarity = tokenLcs == null
+        ? prefixSuffixSimilarity(oldTokens, newTokens)
+        : (oldTokens.length || newTokens.length)
+          ? (2 * tokenLcs) / (oldTokens.length + newTokens.length)
+          : charSimilarity;
+
+      // GitHub-style intraline tint is for local edits within the same logical
+      // line, not for whole-line additions/deletions or block rewrites. Require
+      // both character and token similarity so unrelated comment/code lines do
+      // not get noisy "common letter" highlights. The strong-char escape keeps
+      // punctuation-only edits such as adding a semicolon visible.
+      if (charSimilarity >= 0.62 && tokenSimilarity >= 0.58) {
+        return (charSimilarity * 2) + tokenSimilarity;
+      }
+      if (charSimilarity >= 0.82 && tokenSimilarity >= 0.45) {
+        return charSimilarity + tokenSimilarity;
+      }
+      return 0;
+    }
+
+    function fallbackCharRanges(oldChars, newChars) {
+      let prefix = 0;
+      while (prefix < oldChars.length &&
+             prefix < newChars.length &&
+             oldChars[prefix] === newChars[prefix]) {
+        prefix++;
+      }
+
+      let oldEnd = oldChars.length;
+      let newEnd = newChars.length;
+      while (oldEnd > prefix &&
+             newEnd > prefix &&
+             oldChars[oldEnd - 1] === newChars[newEnd - 1]) {
+        oldEnd--;
+        newEnd--;
+      }
+
+      return {
+        old: prefix < oldEnd ? [[prefix, oldEnd]] : [],
+        new: prefix < newEnd ? [[prefix, newEnd]] : [],
+      };
+    }
+
+    function diffCharRanges(oldText, newText) {
+      if (oldText === newText) return { old: [], new: [] };
+      const oldChars = Array.from(String(oldText || ''));
+      const newChars = Array.from(String(newText || ''));
+      const m = oldChars.length;
+      const n = newChars.length;
+      if (!m || !n) {
+        return {
+          old: m ? [[0, m]] : [],
+          new: n ? [[0, n]] : [],
+        };
+      }
+
+      // Char-level LCS is only for paired replacement lines. Keep a hard cap
+      // so an unusually long minified line cannot spend a frame building a
+      // huge table; the prefix/suffix fallback still gives useful GitHub-like
+      // changed-middle highlighting.
+      if (m * n > 40000) return fallbackCharRanges(oldChars, newChars);
+
+      const dp = Array.from({ length: m + 1 }, () => new Uint32Array(n + 1));
+      for (let i = m - 1; i >= 0; i--) {
+        for (let j = n - 1; j >= 0; j--) {
+          dp[i][j] = oldChars[i] === newChars[j]
+            ? dp[i + 1][j + 1] + 1
+            : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+      }
+
+      const oldChanged = [];
+      const newChanged = [];
+      let i = 0;
+      let j = 0;
+      while (i < m && j < n) {
+        if (oldChars[i] === newChars[j]) {
+          i++;
+          j++;
+        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+          oldChanged.push(i++);
+        } else {
+          newChanged.push(j++);
+        }
+      }
+      while (i < m) oldChanged.push(i++);
+      while (j < n) newChanged.push(j++);
+
+      return {
+        old: rangesFromChangedIndexes(oldChanged),
+        new: rangesFromChangedIndexes(newChanged),
+      };
+    }
+
+    function annotateIncipitDiffRows(rows) {
+      let i = 0;
+      while (i < rows.length) {
+        if (rows[i].kind === 'ctx') {
+          i++;
+          continue;
+        }
+        const start = i;
+        while (i < rows.length && rows[i].kind !== 'ctx') i++;
+        const run = rows.slice(start, i);
+        const dels = run.filter(row => row.kind === 'del');
+        const adds = run.filter(row => row.kind === 'add');
+        if (!dels.length || !adds.length) continue;
+
+        const m = dels.length;
+        const n = adds.length;
+        // Large rewrite hunks are precisely where intraline pairing becomes
+        // least trustworthy: there may be many unrelated deleted/added lines
+        // sharing common words or syntax. Keep those as whole-line shallow
+        // add/del rows instead of spending a frame building another cross
+        // product and risking noisy deep tints.
+        if (m * n > 2500) continue;
+
+        const scores = Array.from({ length: m }, () => new Array(n).fill(0));
+        for (let di = 0; di < m; di++) {
+          for (let aj = 0; aj < n; aj++) {
+            scores[di][aj] = intralinePairScore(dels[di].text, adds[aj].text);
+          }
+        }
+
+        const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+        for (let di = m - 1; di >= 0; di--) {
+          for (let aj = n - 1; aj >= 0; aj--) {
+            const pair = scores[di][aj] > 0 ? scores[di][aj] + dp[di + 1][aj + 1] : 0;
+            dp[di][aj] = Math.max(pair, dp[di + 1][aj], dp[di][aj + 1]);
+          }
+        }
+
+        let di = 0;
+        let aj = 0;
+        while (di < m && aj < n) {
+          const pair = scores[di][aj] > 0 ? scores[di][aj] + dp[di + 1][aj + 1] : -1;
+          if (pair >= dp[di + 1][aj] && pair >= dp[di][aj + 1] && scores[di][aj] > 0) {
+            const ranges = diffCharRanges(dels[di].text, adds[aj].text);
+            dels[di].charRanges = ranges.old;
+            adds[aj].charRanges = ranges.new;
+            di++;
+            aj++;
+          } else if (dp[di + 1][aj] >= dp[di][aj + 1]) {
+            di++;
+          } else {
+            aj++;
+          }
+        }
+      }
+      return rows;
+    }
+
+    function buildIncipitDiffRows(payload) {
+      const oldLines = writeDiffLines(payload.oldText);
+      const newLines = writeDiffLines(payload.newText);
+      if (!oldLines.length) {
+        return newLines.map((text, i) => ({
+          kind: 'add',
+          oldLine: null,
+          newLine: i + 1,
+          text,
+        }));
+      }
+
+      const m = oldLines.length;
+      const n = newLines.length;
+      // Keep the LCS exact for normal tool payloads. If the replacement is
+      // huge, degrade to "all old removed, all new added" rather than spending
+      // a frame building a massive DP table.
+      if (m * n > 500000) {
+        const rows = [];
+        for (let i = 0; i < m; i++) rows.push({ kind: 'del', oldLine: i + 1, newLine: null, text: oldLines[i] });
+        for (let j = 0; j < n; j++) rows.push({ kind: 'add', oldLine: null, newLine: j + 1, text: newLines[j] });
+        return annotateIncipitDiffRows(rows);
+      }
+
+      const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+      for (let i = m - 1; i >= 0; i--) {
+        for (let j = n - 1; j >= 0; j--) {
+          dp[i][j] = oldLines[i] === newLines[j]
+            ? dp[i + 1][j + 1] + 1
+            : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+      }
+
+      const rows = [];
+      let i = 0, j = 0;
+      while (i < m && j < n) {
+        if (oldLines[i] === newLines[j]) {
+          rows.push({ kind: 'ctx', oldLine: i + 1, newLine: j + 1, text: newLines[j] });
+          i++; j++;
+        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+          rows.push({ kind: 'del', oldLine: i + 1, newLine: null, text: oldLines[i] });
+          i++;
+        } else {
+          rows.push({ kind: 'add', oldLine: null, newLine: j + 1, text: newLines[j] });
+          j++;
+        }
+      }
+      while (i < m) rows.push({ kind: 'del', oldLine: i + 1, newLine: null, text: oldLines[i++] });
+      while (j < n) rows.push({ kind: 'add', oldLine: null, newLine: j + 1, text: newLines[j++] });
+      return annotateIncipitDiffRows(rows);
+    }
+
+    function lineInfoBases(lineInfo) {
+      const oldBase = diffPositiveLineNumber(lineInfo && (lineInfo.oldStartLine || lineInfo.startLine)) || 1;
+      const newBase = diffPositiveLineNumber(lineInfo && (lineInfo.newStartLine || lineInfo.startLine)) || 1;
+      return { oldBase, newBase };
+    }
+
+    function fillWriteDiffBody(bodyEl, payload, languageClass, lineInfo) {
+      while (bodyEl.firstChild) bodyEl.removeChild(bodyEl.firstChild);
+
+      const rows = buildIncipitDiffRows(payload);
+      const { oldBase, newBase } = lineInfoBases(lineInfo);
+
+      for (const row of rows) {
+        const rowEl = document.createElement('div');
+        rowEl.setAttribute('data-incipit-diff-island-row', row.kind);
+        rowEl.setAttribute('data-incipit-write-diff-row', row.kind);
+
+        const n = document.createElement('span');
+        n.setAttribute('data-incipit-diff-island-number', '');
+        n.setAttribute('data-incipit-write-diff-number', '');
+        const rawLine = row.kind === 'del' ? row.oldLine : row.newLine;
+        const base = row.kind === 'del' ? oldBase : newBase;
+        n.textContent = rawLine ? String(base + rawLine - 1) : '';
+
+        const pre = document.createElement('pre');
+        pre.setAttribute('data-incipit-diff-island-pre', '');
+        pre.setAttribute('data-incipit-write-diff-pre', '');
+        const code = document.createElement('code');
+        code.setAttribute('data-incipit-diff-island-code', '');
+        code.setAttribute('data-incipit-write-diff-code', '');
+        if (languageClass) code.className = languageClass;
+        code.textContent = row.text;
+        code.__incipitDiffCharKind = row.kind;
+        code.__incipitDiffCharRanges = row.charRanges || [];
+        pre.appendChild(code);
+
+        rowEl.appendChild(n);
+        rowEl.appendChild(pre);
+        bodyEl.appendChild(rowEl);
+      }
+    }
+
+    function incipitCodeUnitOffsetForCodePoint(text, offset) {
+      if (offset <= 0) return 0;
+      let units = 0;
+      let points = 0;
+      for (const ch of String(text || '')) {
+        if (points >= offset) break;
+        units += ch.length;
+        points++;
+      }
+      return units;
+    }
+
+    function wrapIncipitDiffTextNodeRange(node, start, end, kind) {
+      if (!node || !node.parentNode || end <= start) return;
+      const text = node.nodeValue || '';
+      const startOffset = incipitCodeUnitOffsetForCodePoint(text, start);
+      const endOffset = incipitCodeUnitOffsetForCodePoint(text, end);
+      if (endOffset <= startOffset) return;
+
+      let target = node;
+      if (endOffset < text.length) target.splitText(endOffset);
+      if (startOffset > 0) target = target.splitText(startOffset);
+      if (!target.nodeValue) return;
+
+      const span = document.createElement('span');
+      span.setAttribute('data-incipit-diff-island-char', kind);
+      span.setAttribute('data-incipit-write-diff-char', kind);
+      target.parentNode.insertBefore(span, target);
+      span.appendChild(target);
+    }
+
+    function applyIncipitDiffCharRangesToCode(code) {
+      const ranges = Array.isArray(code && code.__incipitDiffCharRanges)
+        ? code.__incipitDiffCharRanges
+        : [];
+      const kind = code && code.__incipitDiffCharKind;
+      if (!code || code.dataset.incipitDiffCharsApplied === '1' || !ranges.length ||
+          (kind !== 'add' && kind !== 'del')) {
+        return;
+      }
+
+      const walker = document.createTreeWalker(code, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          return node.parentElement && node.parentElement.closest('[data-incipit-diff-island-char]')
+            ? NodeFilter.FILTER_REJECT
+            : NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      const nodes = [];
+      let pos = 0;
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const length = Array.from(node.nodeValue || '').length;
+        if (length > 0) {
+          nodes.push({ node, start: pos, end: pos + length });
+          pos += length;
+        }
+      }
+
+      for (let r = ranges.length - 1; r >= 0; r--) {
+        const range = ranges[r];
+        if (!range || range.length < 2) continue;
+        const start = range[0];
+        const end = range[1];
+        for (let i = nodes.length - 1; i >= 0; i--) {
+          const item = nodes[i];
+          const a = Math.max(start, item.start);
+          const b = Math.min(end, item.end);
+          if (b <= a) continue;
+          wrapIncipitDiffTextNodeRange(item.node, a - item.start, b - item.start, kind);
+        }
+      }
+      code.dataset.incipitDiffCharsApplied = '1';
+    }
+
+    function highlightDiffIsland(container) {
+      const typography = globalThis.__incipitTypography;
+      if (typography && typeof typography.highlightAllCode === 'function') {
+        typography.highlightAllCode(container);
+      }
+      container.querySelectorAll?.('[data-incipit-diff-island-code], [data-incipit-write-diff-code]')
+        .forEach(code => applyIncipitDiffCharRangesToCode(code));
+    }
+
+    function closeWriteDiffModal() {
+      if (!writeDiffModal) return;
+      const modal = writeDiffModal;
+      writeDiffModal = null;
+      document.removeEventListener('keydown', modal.onKeyDown, true);
+      if (modal.backdrop && modal.backdrop.parentElement) modal.backdrop.remove();
+    }
+
+    function openWriteDiffModal(payload, block, stats, languageClass, lineInfo) {
+      closeWriteDiffModal();
+      if (!document.body) return;
+
+      const backdrop = document.createElement('div');
+      backdrop.setAttribute('data-incipit-write-diff-modal', '');
+
+      const content = document.createElement('div');
+      content.setAttribute('data-incipit-write-diff-modal-content', '');
+      backdrop.appendChild(content);
+
+      const header = document.createElement('div');
+      header.setAttribute('data-incipit-write-diff-modal-header', '');
+
+      const title = document.createElement('span');
+      title.setAttribute('data-incipit-write-diff-modal-title', '');
+      const filePath = firstToolPathForDisplay(block);
+      title.textContent = basenameOfPath(filePath) || filePath || 'diff';
+      if (filePath) title.dataset.incipitToolFullpath = filePath;
+
+      const counts = document.createElement('span');
+      counts.setAttribute('data-incipit-diff-counts', '');
+      const added = document.createElement('span');
+      added.setAttribute('data-incipit-tool-added', '');
+      added.textContent = '+' + (stats ? stats.added : writeDiffLines(payload.newText).length);
+      const removed = document.createElement('span');
+      removed.setAttribute('data-incipit-tool-removed', '');
+      removed.textContent = '\u2212' + (stats ? stats.removed : 0);
+      counts.appendChild(added);
+      counts.appendChild(removed);
+
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.setAttribute('data-incipit-write-diff-modal-close', '');
+      close.setAttribute('aria-label', 'Close diff');
+      close.textContent = '\u00d7';
+      close.addEventListener('click', evt => {
+        evt.preventDefault();
+        evt.stopPropagation();
+        closeWriteDiffModal();
+      });
+
+      header.appendChild(title);
+      header.appendChild(counts);
+      header.appendChild(close);
+      content.appendChild(header);
+
+      const scroll = document.createElement('div');
+      scroll.setAttribute('data-incipit-write-diff-modal-scroll', '');
+      const bodyEl = document.createElement('div');
+      bodyEl.setAttribute('data-incipit-diff-island-body', '');
+      bodyEl.setAttribute('data-incipit-write-diff-body', '');
+      fillWriteDiffBody(bodyEl, payload, languageClass, lineInfo);
+      scroll.appendChild(bodyEl);
+      content.appendChild(scroll);
+
+      backdrop.addEventListener('click', evt => {
+        if (evt.target !== backdrop) return;
+        evt.preventDefault();
+        closeWriteDiffModal();
+      });
+      const onKeyDown = evt => {
+        if (evt.key !== 'Escape') return;
+        evt.preventDefault();
+        closeWriteDiffModal();
+      };
+      document.addEventListener('keydown', onKeyDown, true);
+      writeDiffModal = { backdrop, onKeyDown };
+
+      document.body.appendChild(backdrop);
+      highlightDiffIsland(content);
+    }
+
+    function ensureWriteDiffPreviewControls(diff, payload, block, stats, languageClass, lineInfo) {
+      const clipped = buildIncipitDiffRows(payload).length > WRITE_DIFF_FULL_BELOW_LINES;
+      diff.style.setProperty(
+        '--incipit-write-diff-preview-max-height',
+        (WRITE_DIFF_PREVIEW_LINES * 1.55) + 'em'
+      );
+      if (clipped) diff.dataset.incipitWriteDiffClipped = '1';
+      else delete diff.dataset.incipitWriteDiffClipped;
+
+      let gradient = findDirectChildByAttr(diff, 'data-incipit-write-diff-gradient');
+      let button = findDirectChildByAttr(diff, 'data-incipit-write-diff-expand');
+
+      if (!clipped && gradient) {
+        gradient.remove();
+        gradient = null;
+      }
+
+      if (clipped && !gradient) {
+        gradient = document.createElement('div');
+        gradient.setAttribute('data-incipit-write-diff-gradient', '');
+        diff.appendChild(gradient);
+      }
+
+      if (!button) {
+        button = document.createElement('button');
+        button.type = 'button';
+        button.setAttribute('data-incipit-write-diff-expand', '');
+        button.addEventListener('click', evt => {
+          evt.preventDefault();
+          evt.stopPropagation();
+          const open = button.__incipitOpenWriteDiff;
+          if (typeof open === 'function') open();
+        });
+        diff.appendChild(button);
+      }
+      const buttonText = clipped ? 'Click to expand' : 'Open';
+      if (button.textContent !== buttonText) button.textContent = buttonText;
+      button.__incipitOpenWriteDiff = () => openWriteDiffModal(payload, block, stats, languageClass, lineInfo);
+    }
+
+    function ensureWriteDiffBody(el, body, block, stats) {
+      const payload = incipitDiffPayload(block);
+      if (!payload || !body || !body.querySelector) {
+        cleanupWriteDiffBody(el, body);
+        return;
+      }
+
+      if (el.dataset.incipitToolWriteDiff !== '1') el.dataset.incipitToolWriteDiff = '1';
+      if (el.dataset.incipitToolDiffIsland !== '1') el.dataset.incipitToolDiffIsland = '1';
+
+      let diff = body.querySelector(':scope > [data-incipit-write-diff]');
+      if (!diff) {
+        diff = document.createElement('div');
+        diff.setAttribute('data-incipit-diff-island', '');
+        diff.setAttribute('data-incipit-write-diff', '');
+        body.insertBefore(diff, body.firstChild);
+      }
+
+      updateDiffHeader(diff, block, stats || { added: 0, removed: 0 });
+      const lineInfoKey = ensureDiffLineInfo(diff, block);
+      const lineInfo = lineInfoKey ? diffLineInfoByKey.get(lineInfoKey) : null;
+
+      const languageClass = languageClassForFilePath(payload.filePath);
+      const lineSig = lineInfo
+        ? [lineInfo.status, lineInfo.oldStartLine || '', lineInfo.newStartLine || '', lineInfo.startLine || ''].join(':')
+        : '';
+      const sig = payload.filePath + '\n' + languageClass + '\n' + lineSig + '\n' +
+        payload.oldText + '\n---\n' + payload.newText;
+      if (diff.__incipitWriteDiffSig === sig) {
+        ensureWriteDiffPreviewControls(diff, payload, block, stats || { added: 0, removed: 0 }, languageClass, lineInfo);
+        highlightDiffIsland(diff);
+        return;
+      }
+      diff.__incipitWriteDiffSig = sig;
+
+      let bodyEl = findDirectChildByAttr(diff, 'data-incipit-write-diff-body');
+      if (!bodyEl) {
+        bodyEl = document.createElement('div');
+        bodyEl.setAttribute('data-incipit-diff-island-body', '');
+        bodyEl.setAttribute('data-incipit-write-diff-body', '');
+        diff.appendChild(bodyEl);
+      }
+      fillWriteDiffBody(bodyEl, payload, languageClass, lineInfo);
+      ensureWriteDiffPreviewControls(diff, payload, block, stats || { added: 0, removed: 0 }, languageClass, lineInfo);
+      highlightDiffIsland(diff);
+    }
+
+    function normalizePathForMatch(value) {
+      return String(value || '').replace(/\\/g, '/');
+    }
+
+    function candidateMatchesPath(candidate, spec) {
+      const text = (candidate.textContent || '').trim();
+      if (!text) return false;
+      const base = basenameOfPath(spec.path);
+      if (base && (text === base || text.startsWith(base + ':') || text.includes(base))) {
+        return true;
+      }
+      const normText = normalizePathForMatch(text);
+      const normPath = normalizePathForMatch(spec.path);
+      if (normText === normPath) return true;
+      if (normText.charCodeAt(0) === 0x2026) {
+        const tail = normText.slice(1).replace(/^[/\\]+/, '');
+        if (tail && normPath.endsWith(tail)) return true;
+      }
+      const hostShort = spec.path.length > 40 ? spec.path.slice(0, 40) + '\u2026' : spec.path;
+      return text === hostShort;
+    }
+
+    function summaryPathCandidates(summary) {
+      if (!summary) return [];
+      return Array.from(summary.querySelectorAll(
+        '[data-incipit-tool-filepath], [class*="toolNameTextSecondary"], [class*="filePath"], [data-incipit-tool-fingerprint]'
+      )).filter(node => {
+        if (!node || node.closest('[data-incipit-tool-stats]')) return false;
+        if (node.hasAttribute('data-incipit-tool-grep-filename')) return false;
+        return true;
+      });
+    }
+
+    function hasNativeAnchor(el) {
+      if (!el || el.nodeType !== 1) return false;
+      if (el.matches && el.matches('a[href]')) return true;
+      return !!(el.querySelector && el.querySelector('a[href]'));
+    }
+
+    function bindToolPathOpen(pathEl, toolEl) {
+      if (pathEl.dataset.incipitToolPathClickBound === '1') return;
+      const open = (evt) => {
+        const spec = toolPathOpenSpecs.get(pathEl);
+        const opener = readHostFileOpener(toolEl);
+        if (!spec || !spec.path || !opener) return;
+        evt.preventDefault();
+        evt.stopPropagation();
+        try {
+          opener.open(spec.path, spec.location || undefined);
+        } catch (e) {
+          console.warn('[incipit] failed to open tool path', e);
+        }
+      };
+      pathEl.addEventListener('click', open);
+      pathEl.addEventListener('keydown', evt => {
+        if (evt.key !== 'Enter' && evt.key !== ' ') return;
+        open(evt);
+      });
+      pathEl.dataset.incipitToolPathClickBound = '1';
+    }
+
+    function stampToolPathNode(pathEl, spec, toolEl) {
+      if (!pathEl || !spec || !spec.path) return;
+      pathEl.dataset.incipitToolFullpath = spec.path;
+      pathEl.dataset.incipitToolOpenPath = spec.path;
+      pathEl.dataset.incipitToolPathSource = spec.source || '';
+      toolPathOpenSpecs.set(pathEl, spec);
+
+      const opener = readHostFileOpener(toolEl);
+      if (opener) {
+        pathEl.dataset.incipitToolOpenable = '1';
+      } else {
+        delete pathEl.dataset.incipitToolOpenable;
+      }
+
+      // Host anchors already carry the exact React onClick closure. Do not
+      // wrap or double-fire them; just add tooltip metadata to their outer
+      // span. Plain spans get our generic click/key handler.
+      if (hasNativeAnchor(pathEl)) return;
+
+      if (opener) {
+        pathEl.setAttribute('role', 'button');
+        pathEl.tabIndex = 0;
+        bindToolPathOpen(pathEl, toolEl);
+      } else {
+        pathEl.removeAttribute('role');
+        pathEl.removeAttribute('tabindex');
+      }
+    }
+
+    function findCandidateForSpec(candidates, used, specs, spec, index) {
+      for (const candidate of candidates) {
+        if (used.has(candidate)) continue;
+        if (candidateMatchesPath(candidate, spec)) return candidate;
+      }
+      const remaining = candidates.filter(c => !used.has(c));
+      if (specs.length === candidates.length && remaining.length) return remaining[0];
+      if (specs.length === 1 && remaining.length === 1) return remaining[0];
+      return null;
+    }
+
+    function findToolPathInsertHost(summary) {
+      const titleWrap = summary && summary.firstElementChild;
+      if (!titleWrap) return summary;
+      const toolNameEl = titleWrap.querySelector('[class*="toolNameText_"]')
+                       || titleWrap.querySelector('[data-incipit-tool-name]');
+      return toolNameEl ? toolNameEl.parentElement : titleWrap;
+    }
+
+    function ensureInjectedToolPath(summary, spec, index) {
+      const host = findToolPathInsertHost(summary);
+      if (!host) return null;
+      const key = (spec.source || 'path') + ':' + index;
+      let span = null;
+      const existing = host.querySelectorAll('[data-incipit-tool-filepath]');
+      for (const node of existing) {
+        if (node.dataset.incipitToolPathKey === key) {
+          span = node;
+          break;
+        }
+      }
+      if (!span) {
+        span = document.createElement('span');
+        span.setAttribute('data-incipit-tool-filepath', '');
+        span.dataset.incipitToolPathKey = key;
+        host.appendChild(span);
+      }
+      if (span.dataset.incipitToolOpenPath !== spec.path) {
+        span.textContent = spec.path;
+        delete span.dataset.incipitToolFullpath;
+        truncatePathSpan(span);
+        span.dataset.incipitToolFullpath = spec.path;
+      }
+      return span;
+    }
+
+    function decorateToolFilePaths(el, summary, data) {
+      const block = data && data.block;
+      if (!block || !summary) return;
+      const specs = toolFilePathSpecs(block);
+      if (!specs.length) return;
+
+      const candidates = summaryPathCandidates(summary);
+      const used = new Set();
+      specs.forEach((spec, index) => {
+        let target = findCandidateForSpec(candidates, used, specs, spec, index);
+        if (target) {
+          used.add(target);
+        } else if (spec.preferInject || spec.source !== 'path') {
+          target = ensureInjectedToolPath(summary, spec, index);
+        }
+        if (target) stampToolPathNode(target, spec, el);
+      });
+    }
+
+    function handleGrepAuxLayout(el, summary, data) {
+      const isGrep = !!(data && data.block && data.block.name === 'Grep');
+      if (!isGrep || !summary) {
+        if (el.dataset.incipitToolGrep) delete el.dataset.incipitToolGrep;
+        ['[data-incipit-tool-fingerprint-aux]',
+         '[data-incipit-tool-grep-filename]',
+         '[data-incipit-tool-grep-chevron]',
+         '[data-incipit-tool-grep-expansion]'].forEach(sel => {
+          const node = el.querySelector(sel);
+          if (node) node.remove();
+        });
+        return;
+      }
+      const titleWrap = summary.firstElementChild;
+      if (!titleWrap) return;
+      if (el.dataset.incipitToolGrep !== '1') el.dataset.incipitToolGrep = '1';
+      if (!el.dataset.incipitToolCollapsed) snapInitialCollapse(el);
+
+      const input = (data.block && data.block.input) || {};
+      const path = typeof input.path === 'string' ? input.path : '';
+      const pattern = typeof input.pattern === 'string' ? input.pattern : '';
+      const root = summary.parentElement;
+      const hostSec = root && root.querySelector(':scope > [class*="secondaryLine_"]');
+      const hostText = hostSec && hostSec.textContent ? hostSec.textContent.trim() : '';
+      // Try to recover the actual tool_result via fiber sibling — host
+      // doesn't render Grep output into a toolBody, so this is the only
+      // path to the real matched lines. Falls back to host text if pierce
+      // fails (different React version, missing sibling, etc).
+      const resultBlock = readToolResult(data.block, el);
+      const resultText = extractResultText(resultBlock);
+      const firstLine = firstGrepLineNumber(resultText, path);
+      const fileOpener = path ? readHostFileOpener(el) : null;
+
+      // Insertion host — host wraps `toolName` and `toolNameTextSecondary`
+      // inside an inner `<div>` (block element) under titleWrap. Appending
+      // our spans to titleWrap puts them after that block, which breaks
+      // the row visually ("Grep" sits alone, our spans wrap below). Insert
+      // siblings to toolName instead so the inline flow stays single-line.
+      const toolNameEl = titleWrap.querySelector('[class*="toolNameText_"]')
+                       || titleWrap.querySelector('[data-incipit-tool-name]');
+      const insertHost = toolNameEl ? toolNameEl.parentElement : titleWrap;
+
+      // 1. fileName span — full input.path; truncatePathSpan replaces the
+      // textContent with `…\parent\basename` and stamps fullpath attr.
+      //
+      // After truncate, force `data-incipit-tool-fullpath = path`
+      // unconditionally — truncatePathSpan only stamps it for paths with
+      // ≥3 segments, but we want every Grep filename to get (a) the hover
+      // tooltip and (b) the click-skip rule that prevents the filename
+      // area from toggling the surrounding fold. Use a separate sentinel
+      // (`data-incipit-tool-grep-path`) for change detection so the
+      // refresh path stays correct even though fullpath is now constant
+      // per row.
+      let fnSpan = insertHost.querySelector('[data-incipit-tool-grep-filename]');
+      if (path) {
+        if (!fnSpan) {
+          fnSpan = document.createElement('span');
+          fnSpan.setAttribute('data-incipit-tool-grep-filename', '');
+          insertHost.appendChild(fnSpan);
+        }
+        if (fnSpan.dataset.incipitToolGrepPath !== path) {
+          fnSpan.dataset.incipitToolGrepPath = path;
+          fnSpan.textContent = path;
+          delete fnSpan.dataset.incipitToolFullpath;
+          truncatePathSpan(fnSpan);
+          if (fnSpan.dataset.incipitToolFullpath !== path) {
+            fnSpan.dataset.incipitToolFullpath = path;
+          }
+        }
+        if (firstLine) fnSpan.dataset.incipitToolGrepLine = String(firstLine);
+        else delete fnSpan.dataset.incipitToolGrepLine;
+
+        if (fileOpener) {
+          fnSpan.dataset.incipitToolGrepOpenable = '1';
+          fnSpan.setAttribute('role', 'button');
+          fnSpan.tabIndex = 0;
+          bindGrepFilenameOpen(fnSpan, el);
+        } else {
+          delete fnSpan.dataset.incipitToolGrepOpenable;
+          fnSpan.removeAttribute('role');
+          fnSpan.removeAttribute('tabindex');
+        }
+      } else if (fnSpan) {
+        fnSpan.remove();
+      }
+
+      // 2. aux span — simplify host's "N lines of output" to "N lines".
+      const m = hostText.match(/(\d+)/);
+      const auxText = m ? (m[1] + ' lines') : '';
+      let auxSpan = insertHost.querySelector('[data-incipit-tool-fingerprint-aux]');
+      if (auxText) {
+        if (!auxSpan) {
+          auxSpan = document.createElement('span');
+          auxSpan.setAttribute('data-incipit-tool-fingerprint-aux', '');
+          insertHost.appendChild(auxSpan);
+        }
+        if (auxSpan.textContent !== auxText) auxSpan.textContent = auxText;
+      } else if (auxSpan) {
+        auxSpan.remove();
+      }
+
+      // 3. chevron — reuses the chevron mask via `data-incipit-tool-chevron`,
+      // independent of `data-incipit-tool-stats` (which is only created
+      // when there's a toolBody).
+      let chevSpan = insertHost.querySelector('[data-incipit-tool-grep-chevron]');
+      if (!chevSpan) {
+        chevSpan = document.createElement('span');
+        chevSpan.setAttribute('data-incipit-tool-grep-chevron', '');
+        chevSpan.setAttribute('data-incipit-tool-chevron', '');
+        insertHost.appendChild(chevSpan);
+      }
+
+      // 4. expansion grid — IN row (the query) + OUT row (the lines count
+      // text we hid from the summary). Mimics the host's toolBodyGrid
+      // layout but uses our own attrs so no host class enters the cascade.
+      const outText = resultText || hostText;
+      let expSpan = el.querySelector('[data-incipit-tool-grep-expansion]');
+      if (pattern || outText) {
+        if (!expSpan) {
+          expSpan = document.createElement('div');
+          expSpan.setAttribute('data-incipit-tool-grep-expansion', '');
+          if (summary.nextSibling) {
+            summary.parentElement.insertBefore(expSpan, summary.nextSibling);
+          } else {
+            summary.parentElement.appendChild(expSpan);
+          }
+        }
+        // Build/update grid rows. Idempotent: only writes textContent when
+        // it differs to avoid every-frame DOM churn.
+        let inLabel = expSpan.querySelector('[data-incipit-tool-grep-row="in"] [data-incipit-tool-grep-label]');
+        let inContent = expSpan.querySelector('[data-incipit-tool-grep-row="in"] [data-incipit-tool-grep-content]');
+        if (!inLabel) {
+          const inRow = document.createElement('div');
+          inRow.setAttribute('data-incipit-tool-grep-row', 'in');
+          inLabel = document.createElement('div');
+          inLabel.setAttribute('data-incipit-tool-grep-label', '');
+          inLabel.textContent = 'IN';
+          inContent = document.createElement('div');
+          inContent.setAttribute('data-incipit-tool-grep-content', '');
+          inRow.appendChild(inLabel);
+          inRow.appendChild(inContent);
+          expSpan.appendChild(inRow);
+        }
+        const inText = path ? '"' + pattern + '" (in ' + path + ')' : '"' + pattern + '"';
+        if (inContent.textContent !== inText) inContent.textContent = inText;
+
+        let outLabel = expSpan.querySelector('[data-incipit-tool-grep-row="out"] [data-incipit-tool-grep-label]');
+        let outContent = expSpan.querySelector('[data-incipit-tool-grep-row="out"] [data-incipit-tool-grep-content]');
+        if (outText) {
+          if (!outLabel) {
+            const outRow = document.createElement('div');
+            outRow.setAttribute('data-incipit-tool-grep-row', 'out');
+            outLabel = document.createElement('div');
+            outLabel.setAttribute('data-incipit-tool-grep-label', '');
+            outLabel.textContent = 'OUT';
+            outContent = document.createElement('div');
+            outContent.setAttribute('data-incipit-tool-grep-content', '');
+            outRow.appendChild(outLabel);
+            outRow.appendChild(outContent);
+            expSpan.appendChild(outRow);
+          }
+          applyGrepOutTruncation(outContent, outText);
+        } else if (outLabel) {
+          outLabel.parentElement.remove();
+        }
+      } else if (expSpan) {
+        expSpan.remove();
+      }
+
+      // 5. click handler — toggles collapsed and animates both expansion
+      // and (if present) host toolBody together. Re-uses `foldDuration`
+      // for constant-speed timing.
+      if (el.dataset.incipitToolBound !== '1') {
+        el.addEventListener('click', evt => {
+          const tgt = evt.target;
+          if (tgt.closest && tgt.closest('[data-incipit-tool-grep-expansion]')) return;
+          if (tgt.closest && tgt.closest('[data-incipit-tool-fullpath], [class*="filePath_"]')) return;
+          evt.stopPropagation();
+          const collapsed = el.dataset.incipitToolCollapsed === 'true';
+          const expansion = el.querySelector('[data-incipit-tool-grep-expansion]');
+          const tBody = el.querySelector('[class*="toolBody_"]');
+          const targets = [];
+          if (expansion) targets.push(expansion);
+          if (tBody && tBody.children.length > 0) targets.push(tBody);
+          if (!targets.length) {
+            el.dataset.incipitToolCollapsed = collapsed ? 'false' : 'true';
+            return;
+          }
+          if (collapsed) animateExpandTargets(el, targets);
+          else           animateCollapseTargets(el, targets);
+        });
+        el.dataset.incipitToolBound = '1';
+      }
+    }
+
+    // Path truncation — deep absolute paths in the tool summary's secondary
+    // slot (`toolNameTextSecondary`, e.g. `C:\Users\...\tests\foo.py`) are
+    // replaced with `…/parent/basename` so a long row stops overflowing the
+    // chat viewport. Original is stashed on `data-incipit-tool-fullpath`
+    // for the CSS hover tooltip to read via `attr()`.
+    //
+    // Idempotent across MO ticks: when our own `…`-prefixed form is still
+    // in place we re-derive from the stored original; if the host swaps in
+    // a new path, the `current != stored && !startsWith('…')` branch
+    // rehydrates the source of truth.
+    //
+    // Intentionally skipped (each degrades to "leave text as-is"):
+    //   - spans with element children (not a plain-text leaf)
+    //   - content with no `/` or `\`, or any whitespace — catches Bash
+    //     command text in the `Plaintext` variant of the same class family
+    //   - paths with fewer than 3 segments (truncating `src/foo.py` would
+    //     be longer than the original, and carries no useful context)
+    function truncatePathSpan(pathSpan) {
+      // If an ancestor already carries our fullpath attr, an outer
+      // selector match already processed this path — skip to avoid
+      // double-truncation (filePath nested inside toolNameTextSecondary).
+      if (pathSpan.parentElement &&
+          pathSpan.parentElement.closest('[data-incipit-tool-fullpath]')) {
+        return;
+      }
+      // Host sometimes wraps the path text in `<a>` (for click-to-open) or
+      // a nested `<span class="filePath_...">` layer. Walk down while
+      // there's exactly one element child so we edit the true text leaf,
+      // preserving any href / event handlers on the wrapper. If the DOM
+      // branches, bail — mixing textContent into a multi-child host
+      // structure would destroy adjacent siblings.
+      let leaf = pathSpan;
+      while (leaf.children.length === 1) {
+        leaf = leaf.firstElementChild;
+      }
+      if (leaf.children.length > 0) return;
+
+      const current = (leaf.textContent || '').trim();
+      if (!current) return;
+
+      // Store the fullpath attr on the outer `pathSpan`, not the leaf —
+      // outer is usually a plain `<span>` (stable hover target, clean CSS
+      // inheritance), while the leaf may be an `<a>` with existing
+      // link-affordance rules that can conflict with `::after` rendering.
+      const stored = pathSpan.dataset.incipitToolFullpath;
+      const hostFresh = (stored && current.charCodeAt(0) === 0x2026) ? stored : current;
+
+      let desired = hostFresh;
+      let shouldStore = false;
+      const looksLikePath =
+        !/\s/.test(hostFresh) && (hostFresh.includes('/') || hostFresh.includes('\\'));
+      if (looksLikePath) {
+        const parts = hostFresh.split(/[\/\\]+/).filter(Boolean);
+        if (parts.length >= 3) {
+          const sep = hostFresh.includes('\\') ? '\\' : '/';
+          desired = '\u2026' + sep + parts[parts.length - 2] + sep + parts[parts.length - 1];
+          shouldStore = true;
+        }
+      }
+
+      if (shouldStore) {
+        if (pathSpan.dataset.incipitToolFullpath !== hostFresh) {
+          pathSpan.dataset.incipitToolFullpath = hostFresh;
+        }
+      } else if (pathSpan.dataset.incipitToolFullpath) {
+        delete pathSpan.dataset.incipitToolFullpath;
+      }
+
+      if (leaf.textContent !== desired) {
+        leaf.textContent = desired;
+      }
+    }
+
+    // Path tooltip portal.  A single `<div>` appended to `<body>`,
+    // `position: fixed`, shown on mouseover of any
+    // `[data-incipit-tool-fullpath]` anywhere in the subtree.
+    //
+    // Rationale: an in-line `::after` tooltip on the path span is subject
+    // to any ancestor's `overflow: hidden` / `contain:` / stacking
+    // context, any of which can silently clip or suppress it. The host
+    // freely sets those on summary / toolUse / message wrappers. A
+    // body-level fixed element sidesteps all of it — one clipping
+    // boundary (the viewport) and one stacking context (the top of the
+    // tree), both of which we control.
+    //
+    // Decoupling: zero reads or writes of host DOM beyond the
+    // `data-incipit-tool-fullpath` attribute that truncatePathSpan has
+    // already placed. Hover detection is delegated on `document.body`
+    // scoped via `closest`; `scroll` / `resize` force-hide so a
+    // re-layout never leaves the tooltip drifting over the wrong
+    // anchor. An rAF loop runs only while visible, reposition + check
+    // `body.contains(target)` so React re-renders auto-dismiss.
+    let tipEl = null;
+    let tipTarget = null;
+    let tipRaf = 0;
+
+    function ensureTipEl() {
+      if (tipEl && document.body && document.body.contains(tipEl)) return tipEl;
+      tipEl = document.createElement('div');
+      tipEl.setAttribute('data-incipit-path-tooltip', '');
+      if (document.body) document.body.appendChild(tipEl);
+      return tipEl;
+    }
+
+    function positionTip() {
+      if (!tipEl || !tipTarget) return;
+      const rect = tipTarget.getBoundingClientRect();
+      const h = tipEl.offsetHeight;
+      const above = rect.top >= h + 8;
+      const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+      const w = tipEl.offsetWidth;
+      const left = Math.max(4, Math.min(rect.left, vw - w - 4));
+      tipEl.style.left = left + 'px';
+      tipEl.style.top = (above ? rect.top - h - 4 : rect.bottom + 4) + 'px';
+    }
+
+    function tickTip() {
+      if (!tipTarget) { tipRaf = 0; return; }
+      if (!document.body || !document.body.contains(tipTarget)) { hideTip(); return; }
+      positionTip();
+      tipRaf = requestAnimationFrame(tickTip);
+    }
+
+    function showTip(target) {
+      const fullpath = target.dataset && target.dataset.incipitToolFullpath;
+      if (!fullpath) return;
+      const el = ensureTipEl();
+      tipTarget = target;
+      el.textContent = fullpath;
+      el.setAttribute('data-incipit-path-tooltip-visible', '1');
+      if (tipRaf) cancelAnimationFrame(tipRaf);
+      tipRaf = requestAnimationFrame(tickTip);
+    }
+
+    function hideTip() {
+      if (!tipEl) return;
+      tipEl.removeAttribute('data-incipit-path-tooltip-visible');
+      tipTarget = null;
+      if (tipRaf) { cancelAnimationFrame(tipRaf); tipRaf = 0; }
+    }
+
+    document.body.addEventListener('mouseover', evt => {
+      const t = evt.target && evt.target.closest
+        ? evt.target.closest('[data-incipit-tool-fullpath]') : null;
+      if (t) showTip(t);
+    }, true);
+    document.body.addEventListener('mouseout', evt => {
+      if (!tipTarget) return;
+      const t = evt.target && evt.target.closest
+        ? evt.target.closest('[data-incipit-tool-fullpath]') : null;
+      if (!t || t !== tipTarget) return;
+      if (t.contains(evt.relatedTarget)) return;
+      hideTip();
+    }, true);
+    window.addEventListener('scroll', hideTip, { capture: true, passive: true });
+    window.addEventListener('resize', hideTip);
+
+    // Idempotent: safe to call repeatedly on the same element. React may
+    // re-render the summary subtree (blowing away our stats span) or
+    // update the tool-use props mid-stream (so the stats numbers need
+    // refreshing), and each MO tick retries every toolUse node.
+    //
+    // Tools without a `toolBody_` child (e.g. Read, Grep when they have no
+    // expandable output) are left untouched — there is nothing to fold,
+    // so showing a chevron would be a lie.
+    //
+    // Click-to-toggle is wired on the toolUse root via event delegation
+    // with two skip rules:
+    //   - click inside the diff body: user is interacting with the diff,
+    //     do not collapse under them.
+    //   - click on the filename path (`toolNameTextSecondary`): preserve
+    //     text-selection for the filename, per user request.
+    // Everything else in the row (tool label, whitespace, +N / -M,
+    // chevron) toggles the fold.
+    function decorateToolUse(el) {
+      // Path truncation runs regardless of fiber/status — it is a pure
+      // display concern and should apply to failed / pending calls too.
+      const summary = el.querySelector('[class*="toolSummary"]');
+      if (summary) {
+        summary
+          .querySelectorAll('[class*="toolNameTextSecondary"], [class*="filePath"]')
+          .forEach(truncatePathSpan);
+      }
+
+      // Grep single-line layout. Runs BEFORE the toolBody early-return
+      // because the host renders Grep without a `toolBody_` container in
+      // many cases (short outputs in particular) — yet still emits two
+      // stacked fingerprint nodes (`toolNameTextSecondary` + standalone
+      // `secondaryLine_*` div). We compress those two rows into one even
+      // when there's no body to fold. Identification is fiber-based, no
+      // dependency on host class names.
+      const grepData = readToolUseBlock(el);
+      decorateToolFilePaths(el, summary, grepData);
+      handleGrepAuxLayout(el, summary, grepData);
+      // Grep is fully self-contained inside `handleGrepAuxLayout` — it
+      // owns chevron, click handler, expansion div, and animation. The
+      // mainline flow below would otherwise inject its own stats span,
+      // bind a second click handler, and force `collapsed=true` reset
+      // every frame, all of which would fight the Grep takeover.
+      if (grepData && grepData.block && grepData.block.name === 'Grep') return;
+
+      // Skip tools with no expandable body. Claude Code emits `toolBody_`
+      // for Edit / Write / Bash / TodoWrite etc. but leaves it empty for
+      // Read / Grep / Glob when the host has nothing to show below the
+      // summary. Adding a chevron to those would lie about expandability.
+      const body = el.querySelector('[class*="toolBody_"]');
+      if (!body || body.children.length === 0) return;
+
+      const data = grepData;
+      if (!data) return;
+      // Blacklist only the terminal failure states. An allowlist on 'success'
+      // would silently break if Claude Code introduces a new status name
+      // (e.g. 'succeeded', 'ok', 'completed') in a minor version — stats and
+      // the chevron would disappear across the board for no visible reason.
+      if (data.status === 'error' || data.status === 'pending') return;
+
+      if (!summary) return;
+
+      // Append stats inside the title wrapper (summary's first <span>), not
+      // as a sibling of it. The host summary is a flex container with the
+      // title wrapper set to `flex: 1`, so a sibling span would get pushed
+      // to the far-right end of the row. Going inside the title wrapper
+      // lands our stats in the inline text flow, right after the path.
+      const titleWrap = summary.firstElementChild;
+      if (!titleWrap) return;
+
+      const stats = computeStatsCached(data.block);
+      const useIncipitDiff = !!incipitDiffPayload(data.block);
+      if (useIncipitDiff) {
+        ensureWriteDiffBody(el, body, data.block, stats);
+      } else {
+        cleanupWriteDiffBody(el, body);
+        decorateInlineDiffHeader(body, data.block, stats);
+        // Generic IN/OUT truncation for tools using the host's
+        // `toolBodyGrid` template. Edit/MultiEdit/Write use incipit's own
+        // diff island when their tool input is readable, so they bypass
+        // this. Grep already returned.
+        // Idempotent across re-decorates.
+        const grid = body.querySelector('[class*="toolBodyGrid"]');
+        if (grid) applyToolBodyTruncation(grid);
+      }
+
+      if (el.dataset.incipitToolBound !== '1') {
+        el.addEventListener('click', evt => {
+          const tgt = evt.target;
+          if (tgt.closest && tgt.closest('[class*="toolBody_"]')) return;
+          // Only skip on actual file paths, not on every tool's secondary
+          // span — host shares the `toolNameTextSecondary*` class family
+          // between Edit/Write paths and Bash/MCP fingerprints.
+          if (tgt.closest && tgt.closest('[data-incipit-tool-fullpath], [class*="filePath_"]')) return;
+          evt.stopPropagation();
+          const collapsed = el.dataset.incipitToolCollapsed === 'true';
+          const body = el.querySelector('[class*="toolBody_"]');
+          if (!body) {
+            el.dataset.incipitToolCollapsed = collapsed ? 'false' : 'true';
+            return;
+          }
+          if (collapsed) animateExpandBody(el, body);
+          else           animateCollapseBody(el, body);
+        });
+        el.dataset.incipitToolBound = '1';
+        if (!el.dataset.incipitToolCollapsed) {
+          snapInitialCollapse(el);
+        }
+      }
+
+      // Granular create-once / textContent-only-on-change DOM updates.
+      // `innerHTML =` would wipe attributes that other passes (math_rewriter
+      // tagging, host_probe dataset writes) have layered onto our spans,
+      // and since those passes immediately re-add them the resulting
+      // attribute churn would flip `innerHTML !== html` back to true
+      // every frame and spin up a 60-fps rebuild loop.
+      let statsEl = summary.querySelector('[data-incipit-tool-stats]');
+      let addedSpan, removedSpan, chevronSpan;
+      if (!statsEl) {
+        statsEl = document.createElement('span');
+        statsEl.setAttribute('data-incipit-tool-stats', '');
+        addedSpan = document.createElement('span');
+        addedSpan.setAttribute('data-incipit-tool-added', '');
+        removedSpan = document.createElement('span');
+        removedSpan.setAttribute('data-incipit-tool-removed', '');
+        chevronSpan = document.createElement('span');
+        chevronSpan.setAttribute('data-incipit-tool-chevron', '');
+        statsEl.appendChild(addedSpan);
+        statsEl.appendChild(removedSpan);
+        statsEl.appendChild(chevronSpan);
+        titleWrap.appendChild(statsEl);
+      } else {
+        addedSpan = statsEl.querySelector('[data-incipit-tool-added]');
+        removedSpan = statsEl.querySelector('[data-incipit-tool-removed]');
+        chevronSpan = statsEl.querySelector('[data-incipit-tool-chevron]');
+      }
+
+      if (stats) {
+        const wantAdded = '+' + stats.added;
+        const wantRemoved = '\u2212' + stats.removed;
+        if (addedSpan.textContent !== wantAdded) addedSpan.textContent = wantAdded;
+        if (removedSpan.textContent !== wantRemoved) removedSpan.textContent = wantRemoved;
+        if (addedSpan.style.display === 'none') addedSpan.style.display = '';
+        if (removedSpan.style.display === 'none') removedSpan.style.display = '';
+        el.dataset.incipitToolHasStats = '1';
+      } else {
+        // Non-Edit/Write tools: hide the +/- spans but keep them in place
+        // and keep the chevron visible.
+        if (addedSpan.style.display !== 'none') addedSpan.style.display = 'none';
+        if (removedSpan.style.display !== 'none') removedSpan.style.display = 'none';
+        delete el.dataset.incipitToolHasStats;
+      }
+
+      // Fingerprint fallback + collapsed/expanded label swap.
+      // Edit/MultiEdit/Write own the row with `+N -M` and never get this.
+      // For everything else with a body:
+      //   - Collapsed: show the host's secondaryLine if it has text; if it
+      //     doesn't, inject our own one-liner from `block.input`.
+      //   - Expanded: hide both host secondaryLine and our fingerprint, show
+      //     a static label ('command' / 'pattern' / 'query' / ...) instead.
+      // CSS owns all visibility — JS only writes textContent and inserts
+      // spans, so there is no per-frame reflow churn from this block.
+      const label = stats ? null : pickLabelFor(data.block.name);
+      let fpSpan = titleWrap.querySelector('[data-incipit-tool-fingerprint]');
+      let labelSpan = titleWrap.querySelector('[data-incipit-tool-fingerprint-label]');
+
+      if (label) {
+        // Host writes the fingerprint into one of two class families:
+        //   - `secondaryLine_*` (Grep, MCP-style "[op] args")
+        //   - `toolNameTextSecondary*` / `toolNameTextSecondaryPlaintext_*`
+        //     (Bash description, Edit/Write file path)
+        // Match both so we never inject a duplicate next to a host-provided one.
+        const hostSec = summary.querySelector(
+          '[class*="secondaryLine_"], [class*="toolNameTextSecondary"]'
+        );
+        const hostHasText = !!(hostSec && hostSec.textContent && hostSec.textContent.trim());
+        if (hostHasText) {
+          // Host already wrote a fingerprint (e.g. Bash description, Grep
+          // pattern, MCP `[op] args`). Don't overwrite — collapsed state
+          // truncates it via CSS, expanded state lets it run full.
+          if (fpSpan) { fpSpan.remove(); fpSpan = null; }
+          if (labelSpan) { labelSpan.remove(); labelSpan = null; }
+        } else {
+          // Fallback: synthesize a one-liner fingerprint from input, swap to
+          // the abstract label on expand.
+          const fpText = pickFallbackFingerprint(data.block.name, data.block.input);
+          if (fpText) {
+            if (!fpSpan) {
+              fpSpan = document.createElement('span');
+              fpSpan.setAttribute('data-incipit-tool-fingerprint', '');
+              titleWrap.insertBefore(fpSpan, statsEl);
+            }
+            if (fpSpan.textContent !== fpText) fpSpan.textContent = fpText;
+          } else if (fpSpan) {
+            fpSpan.remove(); fpSpan = null;
+          }
+          if (!labelSpan) {
+            labelSpan = document.createElement('span');
+            labelSpan.setAttribute('data-incipit-tool-fingerprint-label', '');
+            titleWrap.insertBefore(labelSpan, statsEl);
+          }
+          if (labelSpan.textContent !== label) labelSpan.textContent = label;
+        }
+      } else {
+        if (fpSpan) fpSpan.remove();
+        if (labelSpan) labelSpan.remove();
+      }
+    }
+
+    // Cache `computeStats` results keyed on the fiber block object ref. React
+    // hands us the same `block` reference across renders that didn't actually
+    // change the tool input, so the LCS only runs on truly new blocks. When
+    // the host swaps the prop (mid-stream input update), the new ref naturally
+    // misses cache and recomputes.
+    const statsCache = new WeakMap();
+    function computeStatsCached(block) {
+      if (!block) return null;
+      if (statsCache.has(block)) return statsCache.get(block);
+      const stats = computeStats(block);
+      statsCache.set(block, stats);
+      return stats;
+    }
+
+    // `pendingToolUseRoots` stores the actual toolUse elements that need
+    // (re)decoration this frame, not arbitrary mutation roots. The mutation
+    // handler walks each added subtree to figure out which toolUse(s) are
+    // affected — the previous implementation always re-scanned the entire
+    // document body every animation frame, which scaled poorly with long
+    // sessions.
+    const pendingToolUseRoots = new Set();
+    let rescanScheduled = false;
+    function scheduleRescan() {
+      if (rescanScheduled) return;
+      rescanScheduled = true;
+      requestAnimationFrame(() => {
+        rescanScheduled = false;
+        if (!pendingToolUseRoots.size) return;
+        const tools = Array.from(pendingToolUseRoots);
+        pendingToolUseRoots.clear();
+        for (const t of tools) {
+          if (!t.isConnected) continue;
+          try { decorateToolUse(t); }
+          catch (e) { try { console.warn('[incipit] decorateToolUse failed:', e); } catch (_) {} }
+        }
+      });
+    }
+
+    function enqueueAffectedToolUses(node) {
+      if (!node || node.nodeType !== 1) return;
+      // Case A: the added subtree IS a toolUse, or sits INSIDE one.
+      // Covers React rebuilding the summary subtree mid-stream — the rebuilt
+      // children come in as added nodes whose closest toolUse needs to be
+      // re-decorated because our injected stats span was wiped.
+      const ancestor = node.closest && node.closest('[class*="toolUse_"]');
+      if (ancestor) pendingToolUseRoots.add(ancestor);
+      // Case B: the added subtree CONTAINS toolUse descendants (e.g. a fresh
+      // assistant message landing with a tool call inside).
+      if (node.querySelectorAll) {
+        const inners = node.querySelectorAll('[class*="toolUse_"]');
+        for (const t of inners) pendingToolUseRoots.add(t);
+      }
+    }
+
+    const mo = new MutationObserver(muts => {
+      let dirty = false;
+      for (let i = 0; i < muts.length; i++) {
+        const m = muts[i];
+        if (m.type !== 'childList' || !m.addedNodes.length) continue;
+        for (const node of m.addedNodes) enqueueAffectedToolUses(node);
+        dirty = true;
+      }
+      if (dirty && pendingToolUseRoots.size) scheduleRescan();
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+
+    // Seed the queue with everything already on the page so the first frame
+    // decorates the same set the old `scheduleRescan()` initial call did.
+    if (document.body) {
+      const initial = document.body.querySelectorAll('[class*="toolUse_"]');
+      for (const t of initial) pendingToolUseRoots.add(t);
+      scheduleRescan();
+    }
+  }
+
+  function flushDeferredCodeHighlightsIfReady() {
+    const typography = globalThis.__incipitTypography;
+    if (typography && typeof typography.flushDeferredCodeHighlights === 'function') {
+      return typography.flushDeferredCodeHighlights();
+    }
+    return false;
+  }
+
+  function exposeLegacyHooks() {
+    const hooks = {
+      conversationIsBusy,
+      noteTranscriptActionMutation,
+      scanAndAddCopyButtons,
+    };
+    globalThis.__incipitLegacyHooks = hooks;
+    const typography = globalThis.__incipitTypography;
+    if (typography && typeof typography.configure === 'function') {
+      typography.configure(hooks);
+    }
+    if (typography && typeof typography.scanCopyButtons === 'function') {
+      typography.scanCopyButtons(document.body, { assistantActions: false });
+    }
+    noteTranscriptActionMutation();
+  }
+
+  function init() {
+    log('Initializing legacy interaction module...');
+    preloadEffortBrainIcons();
+    exposeLegacyHooks();
+    setupToolFold();
+    setupDiffSideBars();
+    setupBusyStateObserver();
+    setupFileDragReferenceHint();
+    setupTranscriptActionDebugTools();
+  }
+
+  whenDOMReady(init);
+})();
