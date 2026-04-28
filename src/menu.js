@@ -1899,7 +1899,10 @@ function extractFlags(args) {
 //
 //   1. Cache in `~/.incipit/config.json` under `lastUpdateCheck` (epoch ms)
 //      and `lastKnownLatest` (version string). A cold run HTTPs the npm
-//      registry; warm runs within 12h reuse the cached verdict.
+//      registry; warm runs within 12h reuse the cached verdict unless the
+//      cached verdict would show an upgrade prompt. Prompt text should not
+//      lag behind a just-published release, so outdated cached installs get
+//      one fresh registry probe before we ask the user to upgrade.
 //   2. Opt-out channels — config flag `updateCheck: false`, env var
 //      `INCIPIT_NO_UPDATE_CHECK=1`, and CLI flag `--no-update-check`.
 //      Any one of them skips the check entirely (returns `reason: disabled`).
@@ -1980,10 +1983,28 @@ async function checkForUpdate() {
   const cacheFresh = cachedLatest && (now - cachedAt) < UPDATE_CACHE_MAX_AGE_MS;
 
   if (cacheFresh) {
+    const cachedOutdated = compareVersions(current, cachedLatest) < 0;
+    if (cachedOutdated) {
+      const latest = await fetchLatestVersion(pkg.name, UPDATE_CHECK_TIMEOUT_MS);
+      if (latest) {
+        try {
+          const next = readConfig() || {};
+          next.lastUpdateCheck = now;
+          next.lastKnownLatest = latest;
+          writeConfig(next);
+        } catch (_) {}
+        return {
+          current,
+          latest,
+          outdated: compareVersions(current, latest) < 0,
+          reason: 'fresh',
+        };
+      }
+    }
     return {
       current,
       latest: cachedLatest,
-      outdated: compareVersions(current, cachedLatest) < 0,
+      outdated: cachedOutdated,
       reason: 'cache',
     };
   }
