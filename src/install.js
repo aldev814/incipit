@@ -26,6 +26,7 @@ const {
   pruneRetiredConfigKeys,
   BODY_FONT_SIZE_OPTIONS,
 } = require('./config');
+const { t } = require('./i18n');
 
 const CLAUDE_CODE_EXTENSION_PREFIX = 'anthropic.claude-code-';
 const ENHANCE_TARGET_NAME = 'enhance.js';
@@ -80,10 +81,23 @@ const CHAT_FONT_FAMILY_STACK_DEFAULT =
   "'Microsoft YaHei UI', 'Microsoft YaHei', " +
   "'PingFang SC', system-ui, serif";
 
+function sanitizeFontFamilyValue(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  // Reject characters that can terminate or corrupt a single persisted
+  // font-family setting value when forwarded into settings.json or CSS.
+  if (/[;{}\r\n]/.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
 function buildChatFontFamilyStack(theme) {
   const bodyCss = theme && theme.bodyFontFamily && theme.bodyFontFamily.css;
-  if (typeof bodyCss === 'string' && bodyCss.trim().length > 0) {
-    return bodyCss;
+  const sanitized = sanitizeFontFamilyValue(bodyCss);
+  if (sanitized) {
+    return sanitized;
   }
   return CHAT_FONT_FAMILY_STACK_DEFAULT;
 }
@@ -594,12 +608,12 @@ function buildWebviewConfigPreamble(features, theme, language) {
 }
 
 function buildThemeOverrideBlock(theme) {
-  const bodyFont = theme.bodyFontFamily && theme.bodyFontFamily.css
-    ? theme.bodyFontFamily.css
-    : "'Reading', 'IBM Plex Serif', 'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', system-ui, serif";
-  const codeFont = theme.codeFontFamily && theme.codeFontFamily.css
-    ? theme.codeFontFamily.css
-    : "'Rec Mono Linear', 'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', Consolas, Monaco, 'Courier New', monospace";
+  const rawBody = theme.bodyFontFamily && theme.bodyFontFamily.css;
+  const rawCode = theme.codeFontFamily && theme.codeFontFamily.css;
+  const bodyFont = sanitizeFontFamilyValue(rawBody)
+    || "'Reading', 'IBM Plex Serif', 'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', system-ui, serif";
+  const codeFont = sanitizeFontFamilyValue(rawCode)
+    || "'Rec Mono Linear', 'Noto Sans SC', 'Microsoft YaHei UI', 'Microsoft YaHei', Consolas, Monaco, 'Courier New', monospace";
   return '\n\n/* incipit user theme overrides (generated at apply; do not edit) */\n' +
          ':root {\n' +
          `  --incipit-body-size: ${theme.bodyFontSize}px;\n` +
@@ -1328,9 +1342,10 @@ function installClaudeCodeVSCodeEnhance(resourceRoot, options = {}) {
   const serifStatus = serifWritten > 0
     ? `已写入 ${serifWritten}/${SYSTEM_FONT_FILES.length}`
     : `已存在 (${SYSTEM_FONT_FILES.length} 个)`;
-  const chatFontLabel = theme.bodyFontFamily && theme.bodyFontFamily.key === 'custom'
-    ? 'Custom'
-    : (theme.bodyFontFamily && theme.bodyFontFamily.key) || 'plex-serif';
+  const chatFontKey = theme.bodyFontFamily && theme.bodyFontFamily.key;
+  const chatFontLabel = chatFontKey === 'custom'
+    ? t('apply.font_custom_value')
+    : chatFontKey || 'plex-serif';
   const chatFontStatus = chatFontUpdated
     ? `已更新 → ${chatFontLabel} ${theme.bodyFontSize}px`
     : '已是目标值';

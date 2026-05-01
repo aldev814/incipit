@@ -752,15 +752,22 @@ async function handleConfigure() {
   }
 }
 
-function normalizeCustomFontInput(raw) {
+function normalizeCustomFontInput(raw, fallback) {
   if (!raw) return '';
-  // Already a full CSS stack (contains comma or ends with generic family).
-  if (/[,;]/.test(raw) || /\b(?:serif|sans-serif|monospace|cursive|fantasy|system-ui)\b$/i.test(raw.trim())) {
-    return raw;
+  const value = String(raw).trim();
+  if (!value) return '';
+  // Reject characters that cannot appear in a valid font-family value.
+  if (/[;{}\r\n]/.test(value)) {
+    return '';
   }
-  // Single font name: wrap in quotes and append a sensible fallback.
-  const fallback = /\bmono/i.test(raw) ? 'monospace' : 'serif';
-  return `"${raw.replace(/^["']|["']$/g, '')}", ${fallback}`;
+  // Already a full CSS stack (contains commas) or ends with a generic family.
+  if (/,/.test(value) || /\b(?:serif|sans-serif|monospace|cursive|fantasy|system-ui)\b$/i.test(value)) {
+    return value;
+  }
+  // Single font name: wrap in quotes and append the intended fallback.
+  const fb = fallback || 'serif';
+  const fontName = value.replace(/^["']|["']$/g, '');
+  return `"${fontName}", ${fb}`;
 }
 
 function fontLabelForKey(key, kind, theme) {
@@ -1819,7 +1826,7 @@ async function chooseBodyFontFamily() {
     console.log('  ' + color(t('configure.font_custom_prompt'), Ansi.GREY));
     let raw;
     try { raw = await prompt('  > '); } catch (_) { raw = ''; }
-    const css = normalizeCustomFontInput(String(raw || '').trim());
+    const css = normalizeCustomFontInput(String(raw || '').trim(), 'serif');
     if (css) setBodyFontFamily(css);
     return;
   }
@@ -1889,7 +1896,7 @@ async function chooseCodeFontFamily() {
     console.log('  ' + color(t('configure.font_custom_prompt'), Ansi.GREY));
     let raw;
     try { raw = await prompt('  > '); } catch (_) { raw = ''; }
-    const css = normalizeCustomFontInput(String(raw || '').trim());
+    const css = normalizeCustomFontInput(String(raw || '').trim(), 'monospace');
     if (css) setCodeFontFamily(css);
     return;
   }

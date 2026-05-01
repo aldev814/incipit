@@ -302,6 +302,7 @@ const STRINGS = {
     'configure.font_jetbrains_mono':'JetBrains Mono',
     'configure.font_system_mono': 'System mono',
     'configure.font_custom':      'Custom',
+    'apply.font_custom_value':    'Custom',
 
     // --- apply result summary ---
     'apply.summary_heading':    'Current configuration',
@@ -582,6 +583,7 @@ const STRINGS = {
     'configure.font_jetbrains_mono':'JetBrains Mono',
     'configure.font_system_mono': '系统等宽体',
     'configure.font_custom':      '自定义',
+    'apply.font_custom_value':    '自定义',
 
     // --- apply result summary ---
     'apply.summary_heading':    '当前配置',

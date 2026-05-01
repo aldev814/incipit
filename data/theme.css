@@ -101,7 +101,7 @@
   --app-mention-chip-background: #3d312d !important;
   --app-mention-chip-foreground: #e0a18b !important;
   --incipit-mention-chip-background-hover: #493932 !important;
-  --app-monospace-font-family: Consolas, 'Courier New', monospace !important;
+  --app-monospace-font-family: var(--incipit-code-font) !important;
   --incipit-body-font: 'Reading', 'IBM Plex Serif', 'Noto Sans SC',
                'Microsoft YaHei UI', 'Microsoft YaHei',
                'PingFang SC', system-ui, serif;
