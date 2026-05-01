@@ -186,13 +186,12 @@ details[data-incipit-thinking]:not([open]) > summary[data-incipit-thinking-summa
 
 
 /*
-  Adaptive reading width.
+  Full-width flow content.
 
-  At very narrow viewports (e.g. sidebar ~320 px) the lower bound keeps lines
-  readable.  At moderate widths the preferred 64ch preserves comfortable
-  measure for prose.  On wide screens the upper bound prevents lines from
-  stretching too long.  The formula is pure CSS so it reacts instantly to
-  container / window resizes without JS overhead.
+  Paragraphs, lists, and blockquotes should span the available container
+  width in both the markdown root and message body. `max-width: 100%` prevents
+  overflow, `width: 100%` makes these block elements fill the container, and
+  `box-sizing: border-box` keeps any padding or borders within that width.
 */
 [data-incipit-markdown-root] > p,
 [data-incipit-markdown-root] > ul,
